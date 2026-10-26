@@ -1,15 +1,16 @@
 # OpenCode-Unlimited
 
-**Bypass the OpenCode free-tier daily message limit.**
+**Gets you past OpenCode's free message limit, and tells you when it's back.**
 
-OpenCode keeps one free-message bucket per IP address, so the block below is
-about where you connect from, not which project you are in. This tool checks the
-bucket before you prompt, rotates your project id, and gives you an optional
-proxy path when you need a different IP.
+OpenCode gives you a fixed number of free messages per day and then shows:
 
 ```
 You've used today's free messages. They reset at 2:00 AM - 10/27/2026
 ```
+
+This tool checks whether that limit is still biting, gives you a fresh project
+identity when you need one, and can push OpenCode through a proxy if you want a
+different connection.
 
 ---
 
@@ -21,77 +22,101 @@ cd OpenCode-Unlimited
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Open a new terminal when it finishes. No admin rights, no edits to your OpenCode
-config.
+Done. Open a new terminal window so the `opencode-unlimited` command is found.
+
+Nothing needs admin rights, and your OpenCode settings are not modified.
 
 ---
 
-## Usage
+## How to use it
 
-Changed your IP? Ask the bucket:
+### 1. You hit the limit
+
+Just change your internet connection first — VPN, hotspot, router restart,
+whatever you have. A new connection is what usually brings the messages back.
+
+### 2. Check whether you're clear
 
 ```powershell
-opencode-unlimited test
+opencode-unlimited test -live
 ```
 
-- `FRESH` — you can prompt again.
-- `EMPTY` — this IP is still drained. Change it, test again.
+It asks the app for one tiny reply.
 
-The rest of the commands:
+- `WORKING` — you're free to prompt again.
+- `EMPTY` — the app is still blocked on this connection.
+
+### 3. Want a new project identity too
+
+```powershell
+opencode-unlimited id
+```
+
+New id, applied within a second. No restart, no lost sessions.
+
+That's the whole workflow. Everything else is optional.
+
+---
+
+## Commands
 
 | Command | What it does |
 |---|---|
-| `status` | Project id, egress IP, bucket state |
-| `id` | New project id, takes effect in a second, no restart |
-| `reset` | New id, clears the stuck limit error, re-checks the bucket |
-| `on` / `off` | Plugin on or off |
-| `proxy set socks5://host:port` | Send OpenCode through a proxy |
-| `proxy off` | Back to a direct connection |
+| `opencode-unlimited test` | Free check of the direct API. Fast, but it does not see your app quota. |
+| `opencode-unlimited test -live` | Real check through the app. Costs one message. |
+| `opencode-unlimited id` | New project id |
+| `opencode-unlimited status` | Project id, connection, plugin state |
+| `opencode-unlimited reset` | New id + clears the stale "out of messages" error |
+| `opencode-unlimited on` / `off` | Turn the plugin on or off |
+| `opencode-unlimited proxy set socks5://host:port` | Route OpenCode through a proxy |
+| `opencode-unlimited proxy off` | Back to a direct connection |
+| `opencode-unlimited doctor` | Check node, service, plugin, identity |
+| `opencode-unlimited uninstall` | Remove plugin, menu commands, state |
 
-`run <args>` and `warp` are there too if you want them. `help` lists everything.
+Inside OpenCode's chat you get the same thing as menu commands, just type `/`:
 
-The same thing is inside OpenCode's command menu:
-
-```text
-opencode-unlimited          status
-opencode-unlimited:test     check the bucket
-opencode-unlimited:reset    new id, clear stuck errors
-opencode-unlimited:id       new project id only
+```
+opencode-unlimited
+opencode-unlimited:test
+opencode-unlimited:reset
+opencode-unlimited:id
 ```
 
 ---
 
-## Why the id alone does nothing
+## "It says EMPTY but my messages work"
 
-Every request to the completion endpoint returns the same
-`429 FreeUsageLimitError` whether the project id is random, real, missing, or
-paired with a fake key, and every free model shares the bucket. The limit is
-bound to your egress IP.
+That's expected, and it's the one confusing part.
 
-So rotation keeps sessions unlinked and the IP change is what actually refills
-the bucket.
+`test` without `-live` sends a bare request to OpenCode's API. That endpoint
+answers `429` for anything that isn't the OpenCode app itself — same answer for a
+random project id, a valid key or no key at all. So it can't see your real quota.
 
----
-
-## Will it eat my sessions?
-
-No. Conversations live in `opencode.db`, and this never opens that file unless
-you pass `-Db`. `reset` only deletes rows containing a stored
-`FreeUsageLimitError`.
+The app is the only thing that knows. Use `test -live` when it matters, or simply
+send a message and see if it lands.
 
 ---
 
-## If something breaks
+## Sessions are safe
 
-| Symptom | Fix |
-|---|---|
-| command not found | open a new terminal |
-| `test` says `UNKNOWN` | run `opencode api get /api/provider` once, retry |
-| TUI still shows the limit | `opencode-unlimited reset` |
-| anything else | `opencode-unlimited off`, then `proxy off` |
+Your chats live in `opencode.db`, and this tool never opens that file.
 
-Supported on **Windows 10 (1809+) and Windows 11 only**, with PowerShell 5.1 or
-7+. Node.js is needed only for the SOCKS5 bridge.
+- The plugin only sets one header on outgoing requests.
+- `reset` deletes only the stored "you're out of messages" error rows, nothing else.
+- Restarting the background service never touches sessions.
+
+---
+
+## Something broken? Want to help?
+
+Open an issue on GitHub and describe what you saw — the command, the output, and
+your Windows version is enough to start.
+
+Pull requests are welcome, small ones especially: a clearer message, a
+compatibility fix, a missing check.
+
+> [!TIP]
+> Faster answers in the Discord: **https://discord.gg/8RfQBJh5JZ**
 
 ---
 
@@ -101,8 +126,8 @@ Educational and research use only. Not affiliated with, endorsed by, or
 supported by OpenCode or any of their partners; all trademarks belong to their
 owners.
 
-- It unlocks no entitlement. Free-tier limits are enforced server-side and stay
-  in force.
+- It unlocks no entitlement. The free limit is enforced by OpenCode's servers and
+  stays in force.
 - Using it may break a provider's terms of service. You are responsible for that
   and for any consequence, including account restrictions.
 - Provided "as is", with no warranty and no liability for damage, data loss or

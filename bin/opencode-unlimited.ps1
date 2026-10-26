@@ -23,6 +23,7 @@ $script:PluginDir = Join-Path $script:ConfigDir "plugins"
 $script:PluginFile = Join-Path $script:PluginDir "unlimited-shield.js"
 $script:PidFile = Join-Path $script:ConfigDir "unlimited-bridge.pid"
 $script:LogFile = Join-Path $script:ConfigDir "unlimited-bridge.log"
+$script:IpCacheFile = Join-Path $script:ConfigDir "unlimited-ip.json"
 $script:Gateway = "https://opencode.ai/inference/openai/v1/chat/completions"
 $script:TraceUrl = "https://cloudflare.com/cdn-cgi/trace"
 $script:DefaultModel = "deepseek-v4.1-flash-free"
@@ -165,7 +166,13 @@ function Invoke-WebRequestRaw([string]$Method, [string]$Url, [string]$Body, [str
     }
 }
 
-function Get-EgressIp([string]$ProxyUrl) {
+function Get-EgressIp([string]$ProxyUrl, [switch]$Force) {
+    $cache = Get-Json $script:IpCacheFile
+    if (-not $Force -and $cache -and $cache.ip -and $cache.ip -ne "unavailable") {
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$cache.at
+        if ($age -ge 0 -and $age -lt 60 -and [string]$cache.via -eq $ProxyUrl) { return $cache.ip }
+    }
+    $ip = "unavailable"
     $curl = Get-Curl
     if ($curl) {
         $curlArgs = @("-s", "--max-time", "8")
@@ -174,17 +181,27 @@ function Get-EgressIp([string]$ProxyUrl) {
         $out = Invoke-Curl $curlArgs
         if ($out) {
             foreach ($line in ($out -split "`n")) {
-                if ($line -match "^ip=(.+)$") { return $Matches[1].Trim() }
+                if ($line -match "^ip=(.+)$") { $ip = $Matches[1].Trim() }
             }
         }
     }
-    $result = Invoke-WebRequestRaw "GET" $script:TraceUrl $null $ProxyUrl
-    if ($result.Status -eq 200) {
-        foreach ($line in ($result.Body -split "`n")) {
-            if ($line -match "^ip=(.+)$") { return $Matches[1].Trim() }
+    if ($ip -eq "unavailable") {
+        $result = Invoke-WebRequestRaw "GET" $script:TraceUrl $null $ProxyUrl
+        if ($result.Status -eq 200) {
+            foreach ($line in ($result.Body -split "`n")) {
+                if ($line -match "^ip=(.+)$") { $ip = $Matches[1].Trim() }
+            }
         }
     }
-    return "unavailable"
+    if ($ip -ne "unavailable") {
+        $entry = [ordered]@{
+            ip  = $ip
+            at  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            via = $ProxyUrl
+        }
+        Write-TextFile $script:IpCacheFile ($entry | ConvertTo-Json -Depth 3)
+    }
+    return $ip
 }
 
 function Get-OrgId($cfg) {
@@ -271,9 +288,9 @@ function New-ProbeResult([int]$Code, [string]$Body) {
 
 function Get-BucketLabel([string]$State) {
     switch ($State) {
-        "fresh" { return "FRESH - free messages available on this IP" }
-        "exhausted" { return "EMPTY - daily free messages used up on this IP" }
-        "unknown" { return "UNKNOWN - could not read the bucket" }
+        "fresh" { return "RAW OK - the direct API accepted this request" }
+        "exhausted" { return "RAW 429 - direct API refused; this does not measure the app quota" }
+        "unknown" { return "UNKNOWN - could not read the gate" }
         default { return "ERROR - probe failed" }
     }
 }
@@ -313,11 +330,15 @@ function Get-Identity {
 function Test-NodeSqlite {
     $node = Get-Command node -ErrorAction SilentlyContinue
     if (-not $node) { return $false }
-    $version = & $node.Source -e "process.versions.node" 2>$null
+    $version = & $node.Source --version 2>$null
     if (-not $version) { return $false }
-    $parts = $version.Trim().Split(".")
-    $major = [int]$parts[0]
-    $minor = [int]$parts[1]
+    $clean = $version.Trim().TrimStart("v")
+    $parts = $clean.Split(".")
+    if ($parts.Count -lt 2) { return $false }
+    $major = 0
+    $minor = 0
+    if (-not [int]::TryParse($parts[0], [ref]$major)) { return $false }
+    if (-not [int]::TryParse($parts[1], [ref]$minor)) { return $false }
     if ($major -gt 22) { return $true }
     if ($major -eq 22 -and $minor -ge 5) { return $true }
     return $false
@@ -343,20 +364,39 @@ function Invoke-NodeScript([string]$Source, [string[]]$ScriptArgs) {
     }
 }
 
-function Update-ProjectIds([string]$NewId) {
+function Update-ProjectIds() {
     $db = Get-DatabasePath
     if (-not $db) { Write-Warn2 "opencode.db not found at $script:DataDir"; return }
     if (-not (Test-NodeSqlite)) { Write-Warn2 "node 22.5+ required for -Db rotation, skipped"; return }
     $source = @'
 const { DatabaseSync } = require("node:sqlite");
+const { randomBytes } = require("node:crypto");
 const db = new DatabaseSync(process.argv[2]);
-const rows = db.prepare("select id from project where id != 'global'").all();
-const stmt = db.prepare("update project set id = ? where id = ?");
-let count = 0;
-for (const row of rows) { stmt.run(process.argv[3], row.id); count += 1; }
-console.log("projects renamed: " + count);
+const tables = db.prepare("select name from sqlite_master where type='table'").all();
+const carriers = [];
+for (const table of tables) {
+  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
+  if (columns.includes("project_id")) carriers.push(table.name);
+}
+const projects = db.prepare("select id from project where id != 'global'").all();
+db.exec("begin");
+db.exec("pragma defer_foreign_keys = ON");
+let renamed = 0;
+let touched = 0;
+for (const project of projects) {
+  const next = randomBytes(20).toString("hex");
+  db.prepare("update project set id = ? where id = ?").run(next, project.id);
+  for (const table of carriers) {
+    const key = table === "project" ? "id" : "project_id";
+    const info = db.prepare("update " + table + " set " + key + " = ? where " + key + " = ?").run(next, project.id);
+    touched += Number(info.changes || 0);
+  }
+  renamed += 1;
+}
+db.exec("commit");
+console.log("projects rotated: " + renamed + ", rows updated: " + touched);
 '@
-    $out = Invoke-NodeScript $source @($db, $NewId)
+    $out = Invoke-NodeScript $source @($db)
     if ($out) { Write-Ok ($out -join " ") }
 }
 
@@ -507,6 +547,14 @@ function Stop-Bridge {
     Remove-Item $script:PidFile -Force -ErrorAction SilentlyContinue
 }
 
+function Test-Upstream([string]$ProxyUrl) {
+    $curl = Get-Curl
+    if (-not $curl) { return $true }
+    $out = Invoke-Curl @("-s", "--max-time", "10", "--proxy", $ProxyUrl, $script:TraceUrl)
+    if ($out -and $out -match "ip=") { return $true }
+    return $false
+}
+
 function Apply-Proxy($cfg) {
     if (-not $cfg.proxy) {
         Set-ServiceEnv "HTTPS_PROXY" ""
@@ -514,18 +562,28 @@ function Apply-Proxy($cfg) {
         Set-ServiceEnv "ALL_PROXY" ""
         Set-ServiceEnv "NO_PROXY" "localhost,127.0.0.1"
         Write-Ok "service proxy cleared, direct egress"
-        return
+        return $true
     }
     $url = $cfg.proxy
+    $viaBridge = $false
     if ($url -match "^socks5h?://") {
-        if (-not (Start-Bridge $cfg)) { return }
+        if (-not (Start-Bridge $cfg)) { return $false }
         $url = "http://127.0.0.1:" + $cfg.bridgePort
+        $viaBridge = $true
     }
+    if (-not (Test-Upstream $url)) {
+        Write-Bad ("upstream not answering: " + $cfg.proxy)
+        Write-Info "opencode was not switched, fix the proxy and retry"
+        if ($viaBridge) { Stop-Bridge }
+        return $false
+    }
+    Write-Ok "upstream reachable"
     Set-ServiceEnv "HTTPS_PROXY" $url
     Set-ServiceEnv "HTTP_PROXY" $url
     Set-ServiceEnv "ALL_PROXY" $url
     Set-ServiceEnv "NO_PROXY" "localhost,127.0.0.1"
     Write-Ok ("service proxy set: " + $url)
+    return $true
 }
 
 function Get-WarpCli {
@@ -581,7 +639,7 @@ function Cmd-Id {
     $before = Get-Identity
     $identity = New-Identity
     if ($cfg.rotateDb -or $Rest -contains "-Db" -or $Rest -contains "--db") {
-        Update-ProjectIds $identity.projectId
+        Update-ProjectIds
     }
     if ($before) { Write-Info ("was " + $before.projectId) }
     Save-Config $cfg
@@ -591,13 +649,13 @@ function Cmd-Id {
 function Cmd-Reset {
     Write-Step "==> full reset"
     $cfg = Get-Config
-    $ipBefore = Get-EgressIp $cfg.proxy
+    $ipBefore = Get-EgressIp $cfg.proxy -Force
     Write-Info ("egress ip before: " + $ipBefore)
 
     Write-Step "[1/4] rotating project identity"
     $identity = New-Identity
     if ($cfg.rotateDb -or $Rest -contains "-Db" -or $Rest -contains "--db") {
-        Update-ProjectIds $identity.projectId
+        Update-ProjectIds
     }
     Remove-StuckErrors
 
@@ -611,7 +669,7 @@ function Cmd-Reset {
 
     Write-Step "[3/4] egress ip after"
     Start-Sleep -Seconds 1
-    $ipAfter = Get-EgressIp $cfg.proxy
+    $ipAfter = Get-EgressIp $cfg.proxy -Force
     $cfg.lastIp = $ipAfter
     Save-Config $cfg
     if ($ipAfter -eq $ipBefore) {
@@ -620,40 +678,74 @@ function Cmd-Reset {
         Write-Ok ("new egress ip: " + $ipAfter)
     }
 
-    Write-Step "[4/4] verifying free-tier bucket"
+    Write-Step "[4/4] direct api probe"
     $probe = Invoke-QuotaProbe $cfg
     $cfg.lastBucket = $probe.State
     Save-Config $cfg
     if ($probe.State -eq "fresh") {
         Write-Ok (Get-BucketLabel $probe.State)
-    } elseif ($probe.State -eq "exhausted") {
-        Write-Bad (Get-BucketLabel $probe.State)
-        Write-Info "the cap follows the IP, change IP and run: opencode-unlimited test"
     } else {
         Write-Warn2 (Get-BucketLabel $probe.State)
-        Write-Info $probe.Body
     }
+    Write-Info "a prompt that works is the real signal, or: opencode-unlimited test -live"
     Write-Step ""
     Write-Ok "reset complete"
     Write-Info ("project id: " + $identity.projectId)
 }
 
+function Get-OpenCodeExe {
+    $cmd = Get-Command opencode -ErrorAction SilentlyContinue
+    $candidates = @()
+    if ($cmd) {
+        $candidates += $cmd.Source
+        $candidates += ($cmd.Source -replace "\.(ps1|cmd|bat)$", ".exe")
+    }
+    $candidates += (Join-Path $env:APPDATA "npm\node_modules\@opencode\cli\bin\opencode.exe")
+    foreach ($path in $candidates) {
+        if ($path -and $path -like "*.exe" -and (Test-Path $path)) { return $path }
+    }
+    if ($cmd) { return $cmd.Source }
+    return "opencode"
+}
+
 function Cmd-Test {
     $cfg = Get-Config
-    Write-Step "==> probing free-tier bucket (no auth, costs nothing)"
-    Write-Info ("egress ip: " + (Get-EgressIp $cfg.proxy))
+    if ($Rest -contains "-live" -or $Rest -contains "--live") {
+        $oc = Get-OpenCodeExe
+        $model = $cfg.model
+        if ($model -notmatch "/") { $model = "opencode/" + $model }
+        Write-Step "==> live check through the app (uses one message)"
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $out = (& $oc run -m $model "reply with: ok" 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $previous
+        if ($out -match "Free usage limit reached|used today's free messages") {
+            Write-Bad "EMPTY - the app itself is blocked on this connection"
+            return
+        }
+        if ($code -eq 0 -and $out -match "\bok\b") {
+            Write-Ok "WORKING - the app answered, keep prompting"
+            return
+        }
+        Write-Warn2 "could not confirm, output:"
+        Write-Info (($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 4) -join " ")
+        return
+    }
+    Write-Step "==> direct api probe (free, but not the app quota)"
+    $ip = Get-EgressIp $cfg.proxy
+    Write-Info ("egress ip: " + $ip)
     $probe = Invoke-QuotaProbe $cfg
     $cfg.lastBucket = $probe.State
-    $cfg.lastIp = Get-EgressIp $cfg.proxy
+    $cfg.lastIp = $ip
     Save-Config $cfg
     if ($probe.State -eq "fresh") {
         Write-Ok (Get-BucketLabel $probe.State)
-    } elseif ($probe.State -eq "exhausted") {
-        Write-Bad (Get-BucketLabel $probe.State)
     } else {
         Write-Warn2 (Get-BucketLabel $probe.State)
-        Write-Info ($probe.Body.Substring(0, [Math]::Min(240, $probe.Body.Length)))
     }
+    Write-Info "the app has its own quota; a prompt that works means you are fine"
+    Write-Info "real answer: opencode-unlimited test -live"
 }
 
 function Cmd-Status {
@@ -687,19 +779,18 @@ function Cmd-Status {
     $warp = Get-WarpCli
     Write-Info ("warp-cli   : " + $(if ($warp) { $warp } else { "not installed (optional)" }))
     Write-Step ""
-    Write-Step "bucket"
+    Write-Step "direct api"
     $probe = Invoke-QuotaProbe $cfg
     $cfg.lastBucket = $probe.State
-    $cfg.lastIp = Get-EgressIp $cfg.proxy
+    $ip = Get-EgressIp $cfg.proxy
+    $cfg.lastIp = $ip
     Save-Config $cfg
     if ($probe.State -eq "fresh") {
         Write-Ok (Get-BucketLabel $probe.State)
-    } elseif ($probe.State -eq "exhausted") {
-        Write-Bad (Get-BucketLabel $probe.State)
     } else {
         Write-Warn2 (Get-BucketLabel $probe.State)
     }
-    Write-Info ("last check : " + $cfg.lastBucket + " @ " + $cfg.lastIp)
+    Write-Info "app quota   : not measured here, see: opencode-unlimited test -live"
 }
 
 function Cmd-On {
@@ -739,8 +830,14 @@ function Cmd-Proxy {
             }
             $cfg.proxy = $url
             $cfg.ipMode = "proxy"
+            if (-not (Apply-Proxy $cfg)) {
+                $cfg.proxy = ""
+                $cfg.ipMode = "manual"
+                Save-Config $cfg
+                Write-Info "state left on manual, nothing was restarted"
+                return
+            }
             Save-Config $cfg
-            Apply-Proxy $cfg
             Restart-Service
             Start-Sleep -Seconds 1
             Write-Info ("egress ip via proxy: " + (Get-EgressIp $cfg.proxy))
@@ -779,9 +876,19 @@ function Cmd-Warp {
             Write-Ok "warp off, direct egress"
         }
         "rotate" {
-            & $warp tunnel rotate-keys 2>$null | Out-Null
+            Write-Info "reconnecting warp, this can change the egress ip"
+            $before = Get-EgressIp $cfg.proxy
+            & $warp disconnect 2>$null | Out-Null
             Start-Sleep -Seconds 2
-            Write-Ok ("rotated. egress ip: " + (Get-EgressIp $cfg.proxy))
+            & $warp connect 2>$null | Out-Null
+            Start-Sleep -Seconds 4
+            $after = Get-EgressIp $cfg.proxy
+            if ($after -eq $before) {
+                Write-Warn2 ("ip unchanged: " + $after)
+                Write-Info "warp does not guarantee a new ip, reconnect again or use a proxy"
+            } else {
+                Write-Ok ("new egress ip: " + $before + " -> " + $after)
+            }
         }
         default {
             & $warp status 2>&1 | ForEach-Object { Write-Info $_ }
@@ -792,7 +899,6 @@ function Cmd-Warp {
 function Cmd-Run {
     if ($Rest.Count -eq 0) { Write-Bad "usage: opencode-unlimited run <opencode args>"; return }
     $oc = Resolve-OpenCode
-    $cfg = Get-Config
     $attempt = 1
     while ($attempt -le 3) {
         $out = & $oc @Rest 2>&1 | Out-String
@@ -800,6 +906,7 @@ function Cmd-Run {
         if ($out -match "Free usage limit reached|used today's free messages") {
             Write-Warn2 ("free limit hit (attempt " + $attempt + "/3)")
             Cmd-Id | Out-Null
+            $cfg = Get-Config
             if ($cfg.proxy) { Apply-Proxy $cfg; Restart-Service }
             Start-Sleep -Seconds 2
             $attempt++
@@ -808,8 +915,85 @@ function Cmd-Run {
         Write-Host $out
         return $code
     }
-    Write-Bad "still limited after 3 attempts, change the egress IP and retry"
+    Write-Bad "still limited after 3 attempts"
+    Write-Info "new id does not refill the quota, change the connection and run: opencode-unlimited test -live"
     return 1
+}
+
+function Cmd-Doctor {
+    Write-Step "==> opencode-unlimited doctor"
+    Write-Step ""
+    $os = [System.Environment]::OSVersion.Version
+    Write-Info ("windows    : " + $os.Major + "." + $os.Minor + " build " + $os.Build)
+    Write-Info ("powershell : " + $PSVersionTable.PSVersion.ToString())
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($node) {
+        $nv = (& $node.Source --version 2>$null)
+        Write-Ok ("node       : " + $nv)
+        if (Test-NodeSqlite) { Write-Ok "sqlite     : node:sqlite available" } else { Write-Warn2 "sqlite     : needs node 22.5+ for -Db features" }
+    } else {
+        Write-Warn2 "node       : not found (proxy bridge and -Db need it)"
+    }
+    if (Get-Curl) { Write-Ok "curl       : found" } else { Write-Warn2 "curl       : missing, using .NET fallback" }
+    $oc = Resolve-OpenCode
+    Write-Info ("opencode   : " + $oc)
+    $exe = Get-OpenCodeExe
+    $info = & $exe api get /api/info 2>$null | Out-String
+    $version = [regex]::Match($info, '"version":"[^"]+"').Value
+    if ($version) {
+        Write-Ok ("service    : running, " + $version)
+    } else {
+        Write-Warn2 "service    : not reachable, start opencode once"
+    }
+    $loaded = & $exe api get /api/plugin 2>$null | Out-String
+    if ($loaded -match '"id":"unlimited-shield"') {
+        if ($loaded -match '"id":"unlimited-shield".{0,200}?"status":"active"') { Write-Ok "plugin     : loaded and active" } else { Write-Warn2 "plugin     : loaded but not active" }
+    } else {
+        Write-Warn2 "plugin     : not loaded, run: opencode-unlimited install"
+    }
+    $id = Get-Identity
+    if ($id -and $id.projectId -match "^[0-9a-f]{40}$") { Write-Ok ("identity   : " + $id.projectId) } else { Write-Warn2 "identity   : missing or invalid, run: opencode-unlimited id" }
+    $cfg = Get-Config
+    Write-Info ("upstream   : " + $(if ($cfg.proxy) { $cfg.proxy } else { "none (manual)" }))
+    Write-Info ("egress ip  : " + (Get-EgressIp $cfg.proxy))
+}
+
+function Cmd-Uninstall {
+    Write-Step "==> uninstalling opencode-unlimited"
+    Stop-Bridge
+    Set-PluginEnabled $false
+    Remove-Item $script:PluginFile -Force -ErrorAction SilentlyContinue
+    Remove-Item ($script:PluginFile + ".disabled") -Force -ErrorAction SilentlyContinue
+    Write-Ok "plugin removed"
+
+    $cfgPath = Join-Path $script:ConfigDir "opencode.jsonc"
+    if (-not (Test-Path $cfgPath)) { $cfgPath = Join-Path $script:ConfigDir "opencode.json" }
+    if (Test-Path $cfgPath) {
+        try {
+            $raw = [System.IO.File]::ReadAllText($cfgPath) -replace "^\uFEFF", ""
+            $cfg = $raw | ConvertFrom-Json
+            $prop = $cfg.PSObject.Properties["commands"]
+            if ($prop -and $prop.Value) {
+                foreach ($name in @($prop.Value.PSObject.Properties.Name)) {
+                    if ($name -like "opencode-unlimited*") { $prop.Value.PSObject.Properties.Remove($name) }
+                }
+                [System.IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+                Write-Ok "slash commands removed"
+            }
+        } catch {
+            Write-Warn2 "config not touched, edit it by hand: $cfgPath"
+        }
+    }
+
+    Set-ServiceEnv "HTTPS_PROXY" ""
+    Set-ServiceEnv "HTTP_PROXY" ""
+    Set-ServiceEnv "ALL_PROXY" ""
+    Write-Ok "service proxy cleared"
+    Remove-Item $script:StateFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $script:PidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $script:LogFile -Force -ErrorAction SilentlyContinue
+    Write-Ok "state files removed"
+    Write-Info ("repo and PATH entry kept, delete manually if you want: " + $script:Root)
 }
 
 function Cmd-Help {
@@ -818,7 +1002,7 @@ function Cmd-Help {
     Write-Info "install              deploy plugin, register PATH, write state"
     Write-Info "reset                rotate identity, clear stuck errors, verify bucket"
     Write-Info "id [-Db]             rotate project identity only"
-    Write-Info "test                 probe the free bucket on this IP"
+    Write-Info "test [-live]         direct probe (free) or a real app check (costs 1 message)"
     Write-Info "status               identity, plugin, network, bucket"
     Write-Info "on | off             enable or disable the identity plugin"
     Write-Info "proxy set <url>      route opencode through socks5:// or http://"
@@ -826,6 +1010,8 @@ function Cmd-Help {
     Write-Info "proxy status         show the current upstream"
     Write-Info "warp on|off|rotate   Cloudflare WARP path (optional)"
     Write-Info "run <args...>        run opencode, rotate on free-limit"
+    Write-Info "doctor               check node, service, plugin, identity"
+    Write-Info "uninstall            remove plugin, slash commands, state"
 }
 
 switch ($Command.ToLowerInvariant()) {
@@ -839,5 +1025,7 @@ switch ($Command.ToLowerInvariant()) {
     "proxy" { Cmd-Proxy }
     "warp" { Cmd-Warp }
     "run" { Cmd-Run }
+    "doctor" { Cmd-Doctor }
+    "uninstall" { Cmd-Uninstall }
     default { Cmd-Help }
 }

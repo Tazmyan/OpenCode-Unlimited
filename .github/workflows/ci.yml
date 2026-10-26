@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: node syntax
+        shell: pwsh
+        run: |
+          node --check plugins/unlimited-shield.js
+          node --check lib/proxy-bridge.js
+
+      - name: powershell syntax
+        shell: pwsh
+        run: |
+          $failed = 0
+          foreach ($file in @("bin/opencode-unlimited.ps1", "install.ps1")) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file).Path, [ref]$null, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $failed = 1
+              $errors | ForEach-Object { Write-Host "$file : $($_.Message)" }
+            } else {
+              Write-Host "$file : ok"
+            }
+          }
+          exit $failed
+
+      - name: ascii only
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -File -Include *.ps1, *.js, *.cmd | ForEach-Object {
+            $text = [System.IO.File]::ReadAllText($_.FullName)
+            $count = ($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count
+            if ($count -gt 0) {
+              $bad = 1
+              Write-Host "$($_.Name): $count non-ascii characters"
+            }
+          }
+          exit $bad
+
+      - name: cli responds
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File bin/opencode-unlimited.ps1 help
