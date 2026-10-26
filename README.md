@@ -1,4 +1,4 @@
-# opencode-unlimited
+# OpenCode-Unlimited
 
 **Bypass the OpenCode free-tier daily message limit.**
 
@@ -16,8 +16,8 @@ You've used today's free messages. They reset at 2:00 AM - 10/27/2026
 ## Install
 
 ```powershell
-git clone https://github.com/Tazmyan/opencode-unlimited.git
-cd opencode-unlimited
+git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
+cd OpenCode-Unlimited
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
