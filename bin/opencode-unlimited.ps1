@@ -355,16 +355,26 @@ function Invoke-NodeScript([string]$Source, [string[]]$ScriptArgs) {
     if (-not $node) { return $null }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("unlimited-" + (New-Hex 5) + ".js")
     Write-TextFile $tmp $Source
+    $warn = $env:NODE_NO_WARNINGS
+    $env:NODE_NO_WARNINGS = "1"
     try {
         return (& $node.Source $tmp @ScriptArgs 2>&1)
     } catch {
         return @($_.Exception.Message)
     } finally {
+        if ($null -eq $warn) { Remove-Item Env:\NODE_NO_WARNINGS -ErrorAction SilentlyContinue }
+        else { $env:NODE_NO_WARNINGS = $warn }
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
 }
 
-function Update-ProjectIds() {
+function ConvertTo-DbPath([string]$Path) {
+    $full = $Path
+    try { $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath } catch {}
+    return ($full -replace "\\", "/").TrimEnd("/").ToLowerInvariant()
+}
+
+function Update-ProjectIds([string]$Directory) {
     $db = Get-DatabasePath
     if (-not $db) { Write-Warn2 "opencode.db not found at $script:DataDir"; return }
     if (-not (Test-NodeSqlite)) { Write-Warn2 "node 22.5+ required for -Db rotation, skipped"; return }
@@ -372,13 +382,36 @@ function Update-ProjectIds() {
 const { DatabaseSync } = require("node:sqlite");
 const { randomBytes } = require("node:crypto");
 const db = new DatabaseSync(process.argv[2]);
+const want = (process.argv[3] || "").trim().toLowerCase();
+if (want) {
+  const hit = db.prepare("select project_id, directory from project_directory where lower(replace(directory, char(92), '/')) = lower(replace(?, char(92), '/')) or lower(replace(directory, char(92), '/')) like lower(replace(?, char(92), '/')) || '/%'").all(want, want);
+  const ids = [...new Set(hit.map((r) => r.project_id))];
+  if (ids.length !== 1) {
+    if (ids.length === 0) {
+      const known = db.prepare("select directory from project_directory order by directory").all();
+      console.log("no project matches: " + want);
+      for (const row of known) console.log("  " + row.directory);
+      process.exit(3);
+    }
+    console.log("ambiguous, " + ids.length + " projects match: " + want);
+    process.exit(4);
+  }
+  process.argv[3] = ids[0];
+}
 const tables = db.prepare("select name from sqlite_master where type='table'").all();
 const carriers = [];
 for (const table of tables) {
   const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
   if (columns.includes("project_id")) carriers.push(table.name);
 }
-const projects = db.prepare("select id from project where id != 'global'").all();
+const only = want ? process.argv[3] : null;
+const projects = only
+  ? db.prepare("select id from project where id = ?").all(only)
+  : db.prepare("select id from project where id != 'global'").all();
+if (!projects.length) {
+  console.log("project row missing for " + only);
+  process.exit(5);
+}
 db.exec("begin");
 db.exec("pragma defer_foreign_keys = ON");
 let renamed = 0;
@@ -396,8 +429,14 @@ for (const project of projects) {
 db.exec("commit");
 console.log("projects rotated: " + renamed + ", rows updated: " + touched);
 '@
-    $out = Invoke-NodeScript $source @($db)
-    if ($out) { Write-Ok ($out -join " ") }
+    $out = Invoke-NodeScript $source @($db, $(if ($Directory) { ConvertTo-DbPath $Directory } else { "" }))
+    $ok = $true
+    if ($out) {
+        $line = ($out -join " ").Trim()
+        if ($line -match "no project matches|ambiguous|project row missing") { Write-Bad $line; $ok = $false }
+        else { Write-Ok $line }
+    }
+    return $ok
 }
 
 function Remove-StuckErrors {
@@ -433,11 +472,12 @@ function Install-SlashCommand {
     $cli = Join-Path $script:ScriptDir "opencode-unlimited.ps1"
     $tail = "`n`nAnswer with one short line about what the output above reported. No more."
     $defs = [ordered]@{
-        "opencode-unlimited"      = @{ Args = "status"; Desc = "OpenCode free-tier helper - project id, egress ip, bucket" }
+        "opencode-unlimited"       = @{ Args = "status"; Desc = "OpenCode free-tier helper - project id, egress ip, bucket" }
         "opencode-unlimited:test"  = @{ Args = "test"; Desc = "check the free bucket on this IP (free)" }
-        "opencode-unlimited:reset" = @{ Args = "reset"; Desc = "new id, clear stuck limit errors, re-check bucket" }
-        "opencode-unlimited:id"    = @{ Args = "id"; Desc = "rotate the project id only" }
+        "opencode-unlimited:reset" = @{ Args = "reset"; Desc = "rotate a project (path optional), clear stuck limit errors" }
+        "opencode-unlimited:id"    = @{ Args = "id"; Desc = "rotate a project id, pass a folder to pick which" }
     }
+    $argNames = @("opencode-unlimited:reset", "opencode-unlimited:id")
 
     $cfgPath = Join-Path $script:ConfigDir "opencode.jsonc"
     if (-not (Test-Path $cfgPath)) { $cfgPath = Join-Path $script:ConfigDir "opencode.json" }
@@ -459,7 +499,9 @@ function Install-SlashCommand {
     }
     foreach ($name in $defs.Keys) {
         $def = $defs[$name]
-        $template = '!`powershell -NoProfile -ExecutionPolicy Bypass -File "' + $cli + '" ' + $def.Args + '`' + $tail
+        $argText = $def.Args
+        if ($argNames -contains $name) { $argText = $argText + ' "$ARGUMENTS"' }
+        $template = '!`powershell -NoProfile -ExecutionPolicy Bypass -File "' + $cli + '" ' + $argText + '`' + $tail
         $entry = [pscustomobject]@{ description = $def.Desc; template = $template }
         $cfg.commands | Add-Member -NotePropertyName $name -NotePropertyValue $entry -Force
     }
@@ -633,13 +675,33 @@ function Cmd-Install {
     Write-Ok "done. try: opencode-unlimited status"
 }
 
+function Get-PathArg {
+    foreach ($item in $Rest) {
+        if (-not $item) { continue }
+        if ($item -eq "-Db" -or $item -eq "--db") { continue }
+        if ($item -match "^-") { continue }
+        return $item
+    }
+    return ""
+}
+
+function Get-DbFlag {
+    return ($Rest -contains "-Db" -or $Rest -contains "--db")
+}
+
 function Cmd-Id {
     Write-Step "==> rotating project identity"
     $cfg = Get-Config
+    $target = Get-PathArg
     $before = Get-Identity
     $identity = New-Identity
-    if ($cfg.rotateDb -or $Rest -contains "-Db" -or $Rest -contains "--db") {
-        Update-ProjectIds
+    if ($target) {
+        Write-Info ("target: " + $target)
+        Update-ProjectIds $target | Out-Null
+    } elseif ($cfg.rotateDb -or (Get-DbFlag)) {
+        Update-ProjectIds | Out-Null
+    } else {
+        Write-Info "database rows untouched, use -Db or a path to rotate them"
     }
     if ($before) { Write-Info ("was " + $before.projectId) }
     Save-Config $cfg
@@ -649,13 +711,19 @@ function Cmd-Id {
 function Cmd-Reset {
     Write-Step "==> full reset"
     $cfg = Get-Config
+    $target = Get-PathArg
     $ipBefore = Get-EgressIp $cfg.proxy -Force
     Write-Info ("egress ip before: " + $ipBefore)
 
     Write-Step "[1/4] rotating project identity"
     $identity = New-Identity
-    if ($cfg.rotateDb -or $Rest -contains "-Db" -or $Rest -contains "--db") {
-        Update-ProjectIds
+    if ($target) {
+        Write-Info ("target: " + $target)
+        Update-ProjectIds $target | Out-Null
+    } elseif ($cfg.rotateDb -or (Get-DbFlag)) {
+        Update-ProjectIds | Out-Null
+    } else {
+        Write-Info "database rows untouched, sessions stay on the old id"
     }
     Remove-StuckErrors
 
@@ -1000,8 +1068,8 @@ function Cmd-Help {
     Write-Step "opencode-unlimited <command>"
     Write-Step ""
     Write-Info "install              deploy plugin, register PATH, write state"
-    Write-Info "reset                rotate identity, clear stuck errors, verify bucket"
-    Write-Info "id [-Db]             rotate project identity only"
+    Write-Info "reset [path] [-Db]   rotate a project, clear stuck errors, verify"
+    Write-Info "id [path] [-Db]      rotate the header id, or one project by folder"
     Write-Info "test [-live]         direct probe (free) or a real app check (costs 1 message)"
     Write-Info "status               identity, plugin, network, bucket"
     Write-Info "on | off             enable or disable the identity plugin"

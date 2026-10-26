@@ -46,13 +46,14 @@ It asks the app for one tiny reply.
 - `WORKING` — you're free to prompt again.
 - `EMPTY` — the app is still blocked on this connection.
 
-### 3. Want a new project identity too
+### 3. Reset one project, not the whole install
 
 ```powershell
-opencode-unlimited id
+opencode-unlimited reset "C:\Users\you\projects\my-app"
 ```
 
-New id, applied within a second. No restart, no lost sessions.
+That project gets a fresh identity. Its sessions, messages and history stay
+exactly where they are — only the id moves.
 
 That's the whole workflow. Everything else is optional.
 
@@ -64,9 +65,11 @@ That's the whole workflow. Everything else is optional.
 |---|---|
 | `opencode-unlimited test` | Free check of the direct API. Fast, but it does not see your app quota. |
 | `opencode-unlimited test -live` | Real check through the app. Costs one message. |
-| `opencode-unlimited id` | New project id |
+| `opencode-unlimited id` | New project id, all projects move to fresh ids |
+| `opencode-unlimited id "C:\path\to\project"` | New project id for that one folder |
 | `opencode-unlimited status` | Project id, connection, plugin state |
-| `opencode-unlimited reset` | New id + clears the stale "out of messages" error |
+| `opencode-unlimited reset` | Rotates every project, clears the stale "out of messages" error |
+| `opencode-unlimited reset "C:\path\to\project"` | Same, but only that folder |
 | `opencode-unlimited on` / `off` | Turn the plugin on or off |
 | `opencode-unlimited proxy set socks5://host:port` | Route OpenCode through a proxy |
 | `opencode-unlimited proxy off` | Back to a direct connection |
@@ -78,9 +81,12 @@ Inside OpenCode's chat you get the same thing as menu commands, just type `/`:
 ```
 opencode-unlimited
 opencode-unlimited:test
-opencode-unlimited:reset
-opencode-unlimited:id
+opencode-unlimited:reset C:\Users\you\projects\my-app
+opencode-unlimited:id C:\Users\you\projects\my-app
 ```
+
+The two that rotate take an optional folder. Leave it out and every project
+moves to a fresh id.
 
 ---
 
@@ -99,10 +105,11 @@ send a message and see if it lands.
 
 ## Sessions are safe
 
-Your chats live in `opencode.db`, and this tool never opens that file.
+Your chats live in `opencode.db`, and rotating an id never deletes a row.
 
 - The plugin only sets one header on outgoing requests.
-- `reset` deletes only the stored "you're out of messages" error rows, nothing else.
+- `id` and `reset` rewrite the project id on a project and its rows. Sessions, messages and history follow the new id and stay attached to their folder.
+- `reset` also deletes the stored "you're out of messages" error rows, nothing else.
 - Restarting the background service never touches sessions.
 
 ---
