@@ -29,7 +29,7 @@ $script:Gateway = "https://opencode.ai/inference/openai/v1/chat/completions"
 $script:TraceUrl = "https://cloudflare.com/cdn-cgi/trace"
 $script:DefaultModel = "deepseek-v4.1-flash-free"
 $script:DefaultBridgePort = 8899
-$script:ToolVersion = "1.0.1"
+$script:ToolVersion = "1.0.2"
 $script:InfoCache = $null
 
 $script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
