@@ -1,16 +1,24 @@
 # OpenCode-Unlimited
 
-**Gets you past OpenCode's free message limit, and tells you when it's back.**
+**Tells you when OpenCode's free messages are back, and fixes the banner that lies about it.**
 
-OpenCode gives you a fixed number of free messages per day and then shows:
+OpenCode gives every connection a free daily budget. When it runs out you get:
 
 ```
 You've used today's free messages. They reset at 2:00 AM - 10/27/2026
 ```
 
-This tool checks whether that limit is still biting, gives you a fresh project
-identity when you need one, and can push OpenCode through a proxy if you want a
-different connection.
+Two different things are happening when you see that message, and this tool
+separates them:
+
+1. **The live budget** — metered by OpenCode's servers against the address your
+   traffic leaves from. Nothing local can refill it.
+2. **The stored banner** — a failed request was written into the session as an
+   error row, and the app keeps showing it long after the budget reset.
+
+`opencode-unlimited` reads the real state of the budget, clears the stale
+banner without touching your messages, and tells you plainly whether you are
+waiting on the clock or on your IP.
 
 ---
 
@@ -22,40 +30,78 @@ cd OpenCode-Unlimited
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Done. Open a new terminal window so the `opencode-unlimited` command is found.
+Open a new terminal so the `opencode-unlimited` command is found. No admin
+rights, no changes to your OpenCode config, no proxy is set behind your back.
 
-Nothing needs admin rights, and your OpenCode settings are not modified.
+Requires Windows 10/11 and Node.js 22.5+ (only because the session tools use
+Node's built-in SQLite reader).
 
 ---
 
-## How to use it
-
-### 1. You hit the limit
-
-Just change your internet connection first — VPN, hotspot, router restart,
-whatever you have. A new connection is what usually brings the messages back.
-
-### 2. Check whether you're clear
+## Quick start
 
 ```powershell
-opencode-unlimited test -live
+opencode-unlimited usage      # is the free tier open on this connection?
+opencode-unlimited clear      # wipe the stored "out of messages" banner
+opencode-unlimited test -live # ask the app for one tiny reply
 ```
 
-It asks the app for one tiny reply.
+`usage` answers the only question that matters:
 
-- `WORKING` — you're free to prompt again.
-- `EMPTY` — the app is still blocked on this connection.
-
-### 3. Reset one project, not the whole install
-
-```powershell
-opencode-unlimited reset "C:\Users\you\projects\my-app"
+```
+==> free tier check
+      egress ip : 95.42.79.22
+  [!] SPENT - this connection has no free messages left until 1:59 am 10/29/2026
+      free tier is metered per source address, not per project
+      rotating the project id or session id does not refill it
+      change your egress ip, or wait for the reset above
 ```
 
-That project gets a fresh identity. Its sessions, messages and history stay
-exactly where they are — only the id moves.
+When it says `OPEN`, you can prompt right away.
 
-That's the whole workflow. Everything else is optional.
+---
+
+## Why changing the project id does nothing
+
+This is the part most guides get wrong.
+
+The free budget is counted against your **source IP**, not against
+`x-opencode-project`, not against your session id, not against your account.
+Three requests with a real project id, a made-up project id, and no project
+header at all return the same `429 FreeUsageLimitError` and the same
+`Retry-After`. The bucket is the address.
+
+So the only real refill is a different connection:
+
+1. Change network — VPN, phone hotspot, router reconnect, new Wi-Fi.
+2. Confirm it moved: `opencode-unlimited status` shows `egress ip`.
+3. `opencode-unlimited clear` to drop the stale banner.
+4. `opencode-unlimited test -live` for a real answer.
+
+If the IP is identical, nothing changed and the limit holds.
+
+The window resets daily at **00:00 UTC** (about 2:00 AM in central Europe). The
+`Retry-After` header carries the exact number of seconds left, and this tool
+turns that into a local clock time.
+
+---
+
+## The banner is history, not a live answer
+
+When a prompt is refused, OpenCode stores the failure inside the session as a
+row with `error.type = provider.free-limit`, plus a `retryAfterMs`. Reopening
+that session shows the row again, so an old refusal looks like a fresh one.
+
+`clear` removes exactly those errors and sets the row's outcome back to
+`succeeded`. Rows are never deleted, so no message can end up pointing at a
+missing id, and your chat history stays exactly where it was.
+
+```
+limit errors cleared: 24, idle flags reset: 1
+```
+
+If a **new** prompt still fails after that, the budget itself is spent on that
+connection.
 
 ---
 
@@ -63,64 +109,109 @@ That's the whole workflow. Everything else is optional.
 
 | Command | What it does |
 |---|---|
-| `opencode-unlimited test` | Free check of the direct API. Fast, but it does not see your app quota. |
-| `opencode-unlimited test -live` | Real check through the app. Costs one message. |
+| `opencode-unlimited usage` | Free check: is the budget open on this connection, and when does it reset |
+| `opencode-unlimited test` | Same direct probe, short form |
+| `opencode-unlimited test -live` | Real check through the app. Costs one message |
+| `opencode-unlimited status` | Runtime, identity, network, plugin, budget |
+| `opencode-unlimited version` | Tool version plus the OpenCode version, API version and DB schema it detected |
+| `opencode-unlimited clear` | Strip stored "free limit" errors from every session |
+| `opencode-unlimited clear "C:\path\to\project"` | Same, scoped to one folder |
+| `opencode-unlimited sessions` | List sessions with their ids and folders |
+| `opencode-unlimited sessions "C:\path\to\project"` | List only that folder |
+| `opencode-unlimited reid ses_abc...` | Mint a fresh session id, keep every message |
 | `opencode-unlimited id` | New project id, all projects move to fresh ids |
-| `opencode-unlimited id "C:\path\to\project"` | New project id for that one folder |
-| `opencode-unlimited status` | Project id, connection, plugin state |
-| `opencode-unlimited reset` | Rotates every project, clears the stale "out of messages" error |
+| `opencode-unlimited id "C:\path\to\project"` | New project id for one folder |
+| `opencode-unlimited reset` | Rotate every project, clear the stale banner, verify |
 | `opencode-unlimited reset "C:\path\to\project"` | Same, but only that folder |
-| `opencode-unlimited on` / `off` | Turn the plugin on or off |
+| `opencode-unlimited verify` | Check sessions for orphaned rows and invalid state |
+| `opencode-unlimited verify -fix` | Repair what `verify` found |
+| `opencode-unlimited repair` | Re-link projects to the sessions they own |
 | `opencode-unlimited proxy set socks5://host:port` | Route OpenCode through a proxy |
 | `opencode-unlimited proxy off` | Back to a direct connection |
-| `opencode-unlimited doctor` | Check node, service, plugin, identity |
-| `opencode-unlimited uninstall` | Remove plugin, menu commands, state |
+| `opencode-unlimited warp on\|off\|rotate` | Optional Cloudflare WARP path |
+| `opencode-unlimited doctor` | Check node, service, schema, identity, plugin |
+| `opencode-unlimited uninstall` | Remove the slash commands and local state |
 
-Inside OpenCode's chat you get the same thing as menu commands, just type `/`:
+Inside OpenCode's chat, the same actions as menu commands:
 
 ```
 opencode-unlimited
 opencode-unlimited:test
-opencode-unlimited:reset C:\Users\you\projects\my-app
+opencode-unlimited:clear C:\Users\you\projects\my-app
 opencode-unlimited:id C:\Users\you\projects\my-app
+opencode-unlimited:reset
 ```
 
-The two that rotate take an optional folder. Leave it out and every project
-moves to a fresh id.
-
 ---
 
-## "It says EMPTY but my messages work"
+## Sessions are never damaged
 
-That's expected, and it's the one confusing part.
+Everything lives in `opencode.db`.
 
-`test` without `-live` sends a bare request to OpenCode's API. That endpoint
-answers `429` for anything that isn't the OpenCode app itself — same answer for a
-random project id, a valid key or no key at all. So it can't see your real quota.
-
-The app is the only thing that knows. Use `test -live` when it matters, or simply
-send a message and see if it lands.
-
----
-
-## Sessions are safe
-
-Your chats live in `opencode.db`, and rotating an id never deletes a row.
-
-- The plugin only sets one header on outgoing requests.
-- `id` and `reset` rewrite the project id on a project and its rows. Sessions, messages and history follow the new id and stay attached to their folder.
-- `reset` also deletes the stored "you're out of messages" error rows, nothing else.
+- `clear` and `verify -fix` only rewrite the rows they name. Nothing is deleted.
+- `reid` moves one session to a new id and re-points every child row inside one
+  transaction. On any error it rolls back, so a half-moved session cannot exist.
+- `reset` rewrites project ids; sessions, messages and history follow the new id
+  and stay attached to their folder.
 - Restarting the background service never touches sessions.
 
 ---
 
-## Something broken? Want to help?
+## Works across OpenCode versions
 
-Open an issue on GitHub and describe what you saw — the command, the output, and
-your Windows version is enough to start.
+Nothing about versions is hardcoded. On every run the tool detects:
 
-Pull requests are welcome, small ones especially: a clearer message, a
-compatibility fix, a missing check.
+- the `opencode` binary (PATH, npm global, bun, scoop, chocolatey, local install)
+- its version from `--version`, the running service, or the package manifest
+- the API generation from your `cli.json` schema (`v1`, `v2`, …)
+- the gateway base URL and org id from the provider list, falling back to the
+  known default when the service is not running
+- the free models that exist right now, so probes always use a model you can
+  actually reach
+- the database location (XDG, `OPENCODE_DATA_HOME`, `%LOCALAPPDATA%`) and the
+  live schema — the session table, message table, id columns and fork columns
+  are discovered, not assumed
+
+```
+opencode-unlimited version
+opencode-unlimited 1.0.1
+      opencode   : v2.1.4
+      api        : v2
+      session t. : session_v2
+      gateway    : https://opencode.ai/inference/openai/v1/chat/completions
+```
+
+Detected values are cached for five minutes in
+`~/.config/opencode/unlimited-info.json`. Delete it, or pass `status`, to
+refresh.
+
+---
+
+## Troubleshooting
+
+**`usage` says SPENT but messages still work.**
+Remaining budget is not linear: a long session replays its whole history, so a
+heavy chat can burn far more than an empty one. If a fresh session works and the
+old one does not, it is cost, not identity. `test -live` on the empty session is
+the honest check.
+
+**The banner still shows after `clear`.**
+Restart the app so the session reloads from disk.
+
+**`sessions` prints nothing.**
+Check `opencode-unlimited doctor` — it prints the database path and the detected
+session table.
+
+**Everything looks fine but prompts fail.**
+`opencode-unlimited usage` and compare `egress ip` with what your VPN reports.
+Leaking DNS or an IPv6 route can keep you on the old address.
+
+---
+
+## Issues and help
+
+Open an issue on GitHub with the command you ran and the output — that is enough
+to start. Pull requests welcome, small ones especially.
 
 > [!TIP]
 > Faster answers in the Discord: **https://discord.gg/8RfQBJh5JZ**

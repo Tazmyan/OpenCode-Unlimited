@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$NoPath
+    [switch]$NoPath,
+    [switch]$WithPlugin
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +13,6 @@ $bin = Join-Path $root "bin"
 $entry = Join-Path $bin "opencode-unlimited.cmd"
 $ps1 = Join-Path $bin "opencode-unlimited.ps1"
 $pluginSrc = Join-Path $root "plugins\unlimited-shield.js"
-$bridge = Join-Path $root "lib\proxy-bridge.js"
 
 $userHome = [Environment]::GetFolderPath("UserProfile")
 if (-not $userHome) { $userHome = $env:USERPROFILE }
@@ -22,21 +22,39 @@ $pluginDst = Join-Path $pluginDir "unlimited-shield.js"
 
 function Ok($t) { Write-Host "  [+] $t" -ForegroundColor Green }
 function Bad($t) { Write-Host "  [x] $t" -ForegroundColor Red; exit 1 }
+function Warn($t) { Write-Host "  [!] $t" -ForegroundColor Yellow }
 function Info($t) { Write-Host "      $t" -ForegroundColor DarkGray }
 
 Write-Host "==> opencode-unlimited install"
 
-foreach ($required in @($entry, $ps1, $pluginSrc, $bridge)) {
-    if (-not (Test-Path $required)) { Bad "missing build artifact: $required" }
+$required = @(
+    $entry,
+    $ps1,
+    (Join-Path $root "lib\proxy-bridge.js"),
+    (Join-Path $root "lib\oc-info.js"),
+    (Join-Path $root "lib\db-tools.js"),
+    (Join-Path $root "lib\session-reid.js")
+)
+foreach ($file in $required) {
+    if (-not (Test-Path $file)) { Bad "missing build artifact: $file" }
 }
 Ok "build artifacts present"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
-if ($node) { Ok "node $((& $node.Source --version).Trim())" } else { Info "node not found: proxy bridge and -Db rotation stay unavailable" }
+if ($node) { Ok "node $((& $node.Source --version).Trim())" } else { Info "node not found: session tools and -Db rotation stay unavailable" }
 
-if (-not (Test-Path $pluginDir)) { New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null }
-Copy-Item $pluginSrc $pluginDst -Force
-Ok "plugin deployed: $pluginDst"
+if ($WithPlugin) {
+    if (-not (Test-Path $pluginSrc)) { Bad "missing plugin: $pluginSrc" }
+    if (-not (Test-Path $pluginDir)) { New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null }
+    Copy-Item $pluginSrc $pluginDst -Force
+    Ok "plugin deployed: $pluginDst"
+} elseif (Test-Path $pluginDst) {
+    Warn "an old plugin copy is present: $pluginDst"
+    Info "it rewrites request headers and does not change the quota"
+    Info "remove it with: opencode-unlimited off"
+} else {
+    Ok "plugin not installed (it does not change the quota)"
+}
 
 if (-not $NoPath) {
     $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -61,10 +79,10 @@ if ($shell) {
 
 Write-Host ""
 Write-Host "  next:" -ForegroundColor Cyan
-Info "opencode-unlimited status     identity, plugin, network, bucket"
-Info "opencode-unlimited id         rotate the project id"
-Info "opencode-unlimited test       probe the bucket on this IP (free)"
+Info "opencode-unlimited version    tool plus the detected opencode version"
+Info "opencode-unlimited usage      is the free tier open on this connection"
+Info "opencode-unlimited status     runtime, identity, network, bucket"
+Info "opencode-unlimited sessions   list sessions and their ids"
 Info "opencode-unlimited proxy set socks5://127.0.0.1:1080   optional IP path"
 Write-Host ""
 Ok "installed"
-

@@ -17,6 +17,7 @@ if (-not $script:UserHome) { $script:UserHome = $env:USERPROFILE }
 $script:ConfigDir = Join-Path $script:UserHome ".config\opencode"
 $script:DataDir = Join-Path $script:UserHome ".local\share\opencode"
 $script:StateFile = Join-Path $script:ConfigDir "unlimited.json"
+$script:InfoFile = Join-Path $script:ConfigDir "unlimited-info.json"
 $script:IdentityFile = Join-Path $script:ConfigDir "identity.json"
 $script:LegacyIdentity = Join-Path $script:UserHome ".opencode\identity.json"
 $script:PluginDir = Join-Path $script:ConfigDir "plugins"
@@ -28,6 +29,8 @@ $script:Gateway = "https://opencode.ai/inference/openai/v1/chat/completions"
 $script:TraceUrl = "https://cloudflare.com/cdn-cgi/trace"
 $script:DefaultModel = "deepseek-v4.1-flash-free"
 $script:DefaultBridgePort = 8899
+$script:ToolVersion = "1.0.1"
+$script:InfoCache = $null
 
 $script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $script:Root = Split-Path -Parent $script:ScriptDir
@@ -131,7 +134,7 @@ function Invoke-WebRequestRaw([string]$Method, [string]$Url, [string]$Body, [str
         $request = [System.Net.WebRequest]::Create($Url)
         $request.Method = $Method
         $request.Timeout = 20000
-        $request.UserAgent = "opencode/2.1.4"
+        $request.UserAgent = (Get-UserAgent)
         if ($ProxyUrl -and $ProxyUrl -match "^(https?|socks5h?)://") {
             $request.Proxy = New-Object System.Net.WebProxy($ProxyUrl)
         }
@@ -204,33 +207,131 @@ function Get-EgressIp([string]$ProxyUrl, [switch]$Force) {
     return $ip
 }
 
+function Get-OpenCodeInfo([switch]$Refresh) {
+    if (-not $Refresh -and $script:InfoCache) { return $script:InfoCache }
+
+    $info = [pscustomobject]@{
+        exe          = (Resolve-OpenCode)
+        version      = ""
+        major        = 0
+        api          = 0
+        baseURL      = "https://opencode.ai/inference/openai/v1"
+        gateway      = $script:Gateway
+        orgId        = ""
+        dbPath       = ""
+        dataDir      = $script:DataDir
+        configDir    = $script:ConfigDir
+        freeModels   = @()
+        freeModel    = $script:DefaultModel
+        sessionTable = ""
+        running      = $false
+        source       = "fallback"
+        detectedAt   = 0
+    }
+
+    $helper = Join-Path $script:Root "lib\oc-info.js"
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node -or -not (Test-Path $helper)) {
+        $script:InfoCache = $info
+        return $info
+    }
+
+    $previous = $env:NODE_NO_WARNINGS
+    $env:NODE_NO_WARNINGS = "1"
+    $raw = ""
+    try {
+        $nodeArgs = @($helper, "info")
+        if ($Refresh) { $nodeArgs += "--refresh" }
+        $raw = (& $node.Source @nodeArgs 2>$null | Out-String)
+    } catch {
+        $raw = ""
+    } finally {
+        if ($null -eq $previous) { Remove-Item Env:\NODE_NO_WARNINGS -ErrorAction SilentlyContinue }
+        else { $env:NODE_NO_WARNINGS = $previous }
+    }
+
+    $parsed = $null
+    try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
+    if ($parsed) {
+        if ($parsed.exe) { $info.exe = [string]$parsed.exe }
+        if ($parsed.version) { $info.version = [string]$parsed.version }
+        if ($parsed.major) { $info.major = [int]$parsed.major }
+        if ($parsed.api) { $info.api = [int]$parsed.api }
+        if ($parsed.baseURL) { $info.baseURL = [string]$parsed.baseURL }
+        if ($parsed.gateway) { $info.gateway = [string]$parsed.gateway }
+        if ($parsed.orgId) { $info.orgId = [string]$parsed.orgId }
+        if ($parsed.dbPath) { $info.dbPath = [string]$parsed.dbPath }
+        if ($parsed.dataDir) { $info.dataDir = [string]$parsed.dataDir }
+        if ($parsed.configDir) { $info.configDir = [string]$parsed.configDir }
+        if ($parsed.freeModels) { $info.freeModels = @($parsed.freeModels) }
+        if ($parsed.freeModel) { $info.freeModel = [string]$parsed.freeModel }
+        if ($parsed.service) { $info.running = [bool]$parsed.service.running }
+        if ($parsed.schema -and $parsed.schema.sessionTable) { $info.sessionTable = [string]$parsed.schema.sessionTable }
+        if ($parsed.detectedAt) { $info.detectedAt = [int64]$parsed.detectedAt }
+        $info.source = "detected"
+    }
+
+    $script:InfoCache = $info
+    return $info
+}
+
+function Resolve-ProbeModel($cfg, $info) {
+    $model = [string]$cfg.model
+    if ($model -like "*/*") { $model = $model.Split("/")[-1] }
+    $free = @($info.freeModels)
+    if ($free.Count -gt 0 -and ($free -notcontains $model) -and $info.freeModel) {
+        $model = [string]$info.freeModel
+    }
+    if (-not $model) { $model = $script:DefaultModel }
+    return $model
+}
+
+function Get-GatewayUrl($info) {
+    if ($info -and $info.gateway) { return [string]$info.gateway }
+    return $script:Gateway
+}
+
 function Get-OrgId($cfg) {
     if ($cfg.orgId) { return $cfg.orgId }
-    try {
-        $oc = Resolve-OpenCode
-        $raw = & $oc api get /api/provider 2>$null | Out-String
-        $json = $raw | ConvertFrom-Json
-        foreach ($provider in $json.data) {
-            if ($provider.id -eq "opencode" -and $provider.headers.PSObject.Properties["x-opencode-org-id"]) {
-                $org = $provider.headers."x-opencode-org-id"
-                if ($org) {
-                    $cfg.orgId = $org
-                    Save-Config $cfg
-                    return $org
-                }
-            }
+    $info = Get-OpenCodeInfo
+    if ($info.orgId) {
+        $cfg.orgId = $info.orgId
+        Save-Config $cfg
+        return $info.orgId
+    }
+    return ""
+}
+
+function Get-GatewayToken {
+    $info = Get-OpenCodeInfo
+    $dirs = @()
+    if ($info -and $info.dataDir) { $dirs += $info.dataDir }
+    $dirs += $script:DataDir
+    foreach ($dir in $dirs) {
+        $parsed = Get-Json (Join-Path $dir "auth.json")
+        if (-not $parsed) { continue }
+        $entry = $parsed.opencode
+        if (-not $entry) { continue }
+        if ($entry -is [string]) { if ($entry.Trim()) { return $entry.Trim() } continue }
+        foreach ($field in @("key", "token", "access", "apiKey")) {
+            $value = $entry.$field
+            if ($value -is [string] -and $value.Trim()) { return $value.Trim() }
         }
-    } catch { }
+    }
     return ""
 }
 
 function Invoke-QuotaProbe($cfg) {
-    $org = Get-OrgId $cfg
-    if (-not $org) {
-        return [pscustomobject]@{ State = "unknown"; Status = 0; Body = "org id not discovered yet" }
+    $token = Get-GatewayToken
+    if (-not $token) {
+        return New-ProbeResult 0 "no gateway token in auth.json; run opencode once and sign in" 0
     }
-    $model = $cfg.model
-    if ($model -like "*/*") { $model = $model.Split("/")[-1] }
+
+    $info = Get-OpenCodeInfo
+    $org = Get-OrgId $cfg
+    $model = Resolve-ProbeModel $cfg $info
+    $gateway = Get-GatewayUrl $info
+    $version = if ($info.version) { $info.version } else { "latest" }
     $payload = @{
         model      = $model
         messages   = @(@{ role = "user"; content = "1" })
@@ -238,61 +339,87 @@ function Invoke-QuotaProbe($cfg) {
         stream     = $false
     } | ConvertTo-Json -Depth 5 -Compress
 
-    $curl = Get-Curl
-    if ($curl) {
-        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("unlimited-probe-" + (New-Hex 6) + ".json")
-        Write-TextFile $tmp $payload
-        try {
-            $raw = Invoke-Curl @(
-                "-s", "-o", "-", "-w", "`n%{http_code}",
-                "--max-time", "20",
-                "-X", "POST", $script:Gateway,
-                "-H", "Content-Type: application/json",
-                "-H", "User-Agent: opencode/2.1.4",
-                "-H", "x-opencode-client: cli",
-                "-H", ("x-opencode-project: " + (New-Hex 20)),
-                "-H", ("x-opencode-org-id: " + $org),
-                "--data-binary", ("@" + $tmp)
-            )
-            if ($null -ne $raw) {
-                $idx = $raw.LastIndexOf("`n")
-                if ($idx -gt 0) {
-                    $body = $raw.Substring(0, $idx).Trim()
-                    $code = [int]($raw.Substring($idx + 1).Trim())
-                    return New-ProbeResult $code $body
-                }
+    if (-not (Get-Curl)) {
+        return New-ProbeResult 0 "curl not found on PATH" 0
+    }
+
+    $stamp = New-Hex 6
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("unlimited-probe-" + $stamp + ".json")
+    $hdr = Join-Path ([System.IO.Path]::GetTempPath()) ("unlimited-probe-" + $stamp + ".hdr")
+    Write-TextFile $tmp $payload
+    try {
+        $curlArgs = @(
+            "-s", "-o", "-", "-D", $hdr, "-w", "`n%{http_code}",
+            "--max-time", "20",
+            "-X", "POST", $gateway,
+            "-H", "Content-Type: application/json",
+            "-H", ("Authorization: Bearer " + $token),
+            "-H", ("User-Agent: opencode/latest/" + $version + "/cli"),
+            "-H", "x-opencode-client: cli"
+        )
+        if ($org) { $curlArgs += @("-H", ("x-opencode-org-id: " + $org)) }
+        $curlArgs += @("--data-binary", ("@" + $tmp))
+
+        $raw = Invoke-Curl $curlArgs
+        $retry = 0
+        if (Test-Path $hdr) {
+            foreach ($line in (Get-Content $hdr -ErrorAction SilentlyContinue)) {
+                if ($line -match "^\s*retry-after\s*:\s*(\d+)") { $retry = [int]$Matches[1] }
             }
-        } finally {
-            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         }
+        if ($null -ne $raw) {
+            $idx = $raw.LastIndexOf("`n")
+            if ($idx -gt 0) {
+                $body = $raw.Substring(0, $idx).Trim()
+                $code = 0
+                [void][int]::TryParse($raw.Substring($idx + 1).Trim(), [ref]$code)
+                return New-ProbeResult $code $body $retry
+            }
+        }
+        return New-ProbeResult 0 "probe produced no output" 0
+    } finally {
+        Remove-Item $tmp, $hdr -Force -ErrorAction SilentlyContinue
     }
-
-    $headers = "x-opencode-org-id: " + $org
-    $fallback = Invoke-WebRequestRaw "POST" $script:Gateway $payload $null
-    return New-ProbeResult $fallback.Status $fallback.Body
 }
 
-function New-ProbeResult([int]$Code, [string]$Body) {
-    $state = "unknown"
+function New-ProbeResult([int]$Code, [string]$Body, [int]$RetryAfter) {
+    $state = "error"
     if ($Code -eq 429 -and $Body -match "FreeUsageLimitError") {
-        $state = "exhausted"
-    } elseif ($Code -eq 400 -and $Body -match "x-opencode-org-id") {
-        $state = "unknown"
+        $state = "spent"
+    } elseif ($Code -ge 200 -and $Code -lt 300) {
+        $state = "open"
     } elseif ($Code -gt 0) {
-        $state = "fresh"
-    } else {
-        $state = "error"
+        $state = "other"
     }
-    return [pscustomobject]@{ State = $state; Status = $Code; Body = $Body }
+    $resetAt = $null
+    if ($RetryAfter -gt 0) {
+        $resetAt = (Get-Date).ToUniversalTime().AddSeconds($RetryAfter)
+    }
+    return [pscustomobject]@{
+        State      = $state
+        Status     = $Code
+        Body       = $Body
+        RetryAfter = $RetryAfter
+        ResetAt    = $resetAt
+    }
 }
 
-function Get-BucketLabel([string]$State) {
-    switch ($State) {
-        "fresh" { return "RAW OK - the direct API accepted this request" }
-        "exhausted" { return "RAW 429 - direct API refused; this does not measure the app quota" }
-        "unknown" { return "UNKNOWN - could not read the gate" }
-        default { return "ERROR - probe failed" }
+function Get-BucketLabel($Probe) {
+    if ($Probe.State -eq "open") {
+        return "OPEN - this connection still has free messages left"
     }
+    if ($Probe.State -eq "spent") {
+        $text = "SPENT - this connection has no free messages left"
+        if ($Probe.ResetAt) {
+            $local = $Probe.ResetAt.ToLocalTime()
+            $text += (" until " + $local.ToString("h:mm tt") + " " + $local.ToString("M/d/yyyy"))
+        }
+        return $text
+    }
+    if ($Probe.State -eq "other") {
+        return ("HTTP " + $Probe.Status + " - " + $Probe.Body)
+    }
+    return "UNKNOWN - could not reach the gateway"
 }
 
 function New-Identity([switch]$Quiet) {
@@ -345,9 +472,33 @@ function Test-NodeSqlite {
 }
 
 function Get-DatabasePath {
-    $db = Join-Path $script:DataDir "opencode.db"
-    if (Test-Path $db) { return $db }
+    $info = Get-OpenCodeInfo
+    if ($info.dbPath -and (Test-Path $info.dbPath)) { return $info.dbPath }
+    $candidates = @(
+        (Join-Path $script:DataDir "opencode.db"),
+        (Join-Path $script:DataDir "opencode.sqlite"),
+        (Join-Path $env:LOCALAPPDATA "opencode\opencode.db"),
+        (Join-Path $env:LOCALAPPDATA "opencode\data\opencode.db")
+    )
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path $path)) { return $path }
+    }
     return ""
+}
+
+function Invoke-NodeHelper([string]$Helper, [string[]]$HelperArgs) {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) { return "" }
+    $previous = $env:NODE_NO_WARNINGS
+    $env:NODE_NO_WARNINGS = "1"
+    try {
+        return (& $node.Source $Helper @HelperArgs 2>$null | Out-String)
+    } catch {
+        return ""
+    } finally {
+        if ($null -eq $previous) { Remove-Item Env:\NODE_NO_WARNINGS -ErrorAction SilentlyContinue }
+        else { $env:NODE_NO_WARNINGS = $previous }
+    }
 }
 
 function Invoke-NodeScript([string]$Source, [string[]]$ScriptArgs) {
@@ -370,48 +521,112 @@ function Invoke-NodeScript([string]$Source, [string[]]$ScriptArgs) {
 
 function ConvertTo-DbPath([string]$Path) {
     $full = $Path
-    try { $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath } catch {}
-    return ($full -replace "\\", "/").TrimEnd("/").ToLowerInvariant()
+    try { $full = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName } catch {}
+    return ($full -replace "\\", "/").TrimEnd("/")
 }
 
 function Update-ProjectIds([string]$Directory) {
     $db = Get-DatabasePath
-    if (-not $db) { Write-Warn2 "opencode.db not found at $script:DataDir"; return }
-    if (-not (Test-NodeSqlite)) { Write-Warn2 "node 22.5+ required for -Db rotation, skipped"; return }
+    if (-not $db) { Write-Warn2 "opencode.db not found at $script:DataDir"; return $false }
+    if (-not (Test-NodeSqlite)) { Write-Warn2 "node 22.5+ required for database rotation, skipped"; return $false }
     $source = @'
 const { DatabaseSync } = require("node:sqlite");
 const { randomBytes } = require("node:crypto");
+const fs = require("node:fs");
+
+const norm = (value) => String(value || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 const db = new DatabaseSync(process.argv[2]);
-const want = (process.argv[3] || "").trim().toLowerCase();
+const wantRaw = (process.argv[3] || "").trim();
+const want = norm(wantRaw);
+
+const known = db.prepare("select project_id, directory from project_directory").all();
+const idsFor = (needle) => [...new Set(known.filter((row) => norm(row.directory) === needle).map((row) => row.project_id))];
+
+let target = null;
+let registered = false;
+
 if (want) {
-  const hit = db.prepare("select project_id, directory from project_directory where lower(replace(directory, char(92), '/')) = lower(replace(?, char(92), '/')) or lower(replace(directory, char(92), '/')) like lower(replace(?, char(92), '/')) || '/%'").all(want, want);
-  const ids = [...new Set(hit.map((r) => r.project_id))];
-  if (ids.length !== 1) {
-    if (ids.length === 0) {
-      const known = db.prepare("select directory from project_directory order by directory").all();
-      console.log("no project matches: " + want);
-      for (const row of known) console.log("  " + row.directory);
-      process.exit(3);
+  let ids = idsFor(want);
+
+  if (!ids.length) {
+    ids = [...new Set(known.filter((row) => norm(row.directory).startsWith(want + "/")).map((row) => row.project_id))];
+  }
+
+  if (!ids.length && fs.existsSync(wantRaw)) {
+    let cursor = want;
+    while (cursor && cursor !== "/" && !ids.length) {
+      ids = idsFor(cursor);
+      if (ids.length) break;
+      cursor = cursor.slice(0, cursor.lastIndexOf("/"));
     }
-    console.log("ambiguous, " + ids.length + " projects match: " + want);
+  }
+
+  if (ids.length > 1) {
+    console.log("ambiguous, " + ids.length + " projects match: " + wantRaw);
+    for (const id of ids) {
+      const row = known.find((r) => r.project_id === id);
+      console.log("  " + (row ? row.directory : id));
+    }
     process.exit(4);
   }
-  process.argv[3] = ids[0];
+
+  if (ids.length === 1) {
+    target = ids[0];
+  } else if (!fs.existsSync(wantRaw)) {
+    console.log("no project matches and the folder does not exist: " + wantRaw);
+    const seen = new Set();
+    for (const row of known) {
+      const key = norm(row.directory);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      console.log("  " + row.directory);
+    }
+    process.exit(3);
+  } else {
+    const orphanRow = db.prepare("select project_id from session_v2 where lower(replace(directory, char(92), '/')) = ? limit 1").get(wantRaw.replace(/\\/g, "/").toLowerCase());
+    if (orphanRow) {
+      const now = Date.now();
+      const worktree = wantRaw.replace(/\\/g, "/").replace(/\/+$/, "");
+      db.exec("begin");
+      db.prepare("insert or ignore into project (id, worktree, time_created, time_updated, sandboxes, time_active) values (?, ?, ?, ?, '[]', ?)").run(orphanRow.project_id, worktree, now, now, now);
+      db.prepare("insert into project_directory (project_id, directory, time_created) values (?, ?, ?)").run(orphanRow.project_id, worktree, now);
+      db.exec("commit");
+      target = orphanRow.project_id;
+    } else {
+      const now = Date.now();
+      const worktree = wantRaw.replace(/\\/g, "/").replace(/\/+$/, "");
+      const fresh = randomBytes(20).toString("hex");
+      db.exec("begin");
+      db.prepare("insert into project (id, worktree, time_created, time_updated, sandboxes, time_active) values (?, ?, ?, ?, '[]', ?)").run(fresh, worktree, now, now, now);
+      db.prepare("insert into project_directory (project_id, directory, time_created) values (?, ?, ?)").run(fresh, worktree, now);
+      db.exec("commit");
+      target = fresh;
+      registered = true;
+    }
+  }
 }
+
+if (registered) {
+  console.log("registered new project: " + target.slice(0, 12) + " -> " + wantRaw);
+  process.exit(0);
+}
+
 const tables = db.prepare("select name from sqlite_master where type='table'").all();
 const carriers = [];
 for (const table of tables) {
-  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
+  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((column) => column.name);
   if (columns.includes("project_id")) carriers.push(table.name);
 }
-const only = want ? process.argv[3] : null;
-const projects = only
-  ? db.prepare("select id from project where id = ?").all(only)
+
+const projects = target
+  ? db.prepare("select id from project where id = ?").all(target)
   : db.prepare("select id from project where id != 'global'").all();
+
 if (!projects.length) {
-  console.log("project row missing for " + only);
+  console.log("project row missing: " + (target || "all"));
   process.exit(5);
 }
+
 db.exec("begin");
 db.exec("pragma defer_foreign_keys = ON");
 let renamed = 0;
@@ -434,33 +649,28 @@ console.log("projects rotated: " + renamed + ", rows updated: " + touched);
     if ($out) {
         $line = ($out -join " ").Trim()
         if ($line -match "no project matches|ambiguous|project row missing") { Write-Bad $line; $ok = $false }
+        elseif ($line -match "registered new project") { Write-Ok $line }
         else { Write-Ok $line }
     }
     return $ok
 }
 
-function Remove-StuckErrors {
+function Invoke-DbTool([string]$Action, [string]$Argument) {
     $db = Get-DatabasePath
-    if (-not $db) { return }
-    if (-not (Test-NodeSqlite)) { return }
-    $source = @'
-const { DatabaseSync } = require("node:sqlite");
-const db = new DatabaseSync(process.argv[2]);
-let removed = 0;
-const tables = db.prepare("select name from sqlite_master where type='table'").all();
-for (const table of tables) {
-  const columns = db.prepare("pragma table_info(" + table.name + ")").all().map((c) => c.name);
-  const text = columns.filter((c) => c !== "id" && c !== "session_id");
-  if (!text.length) continue;
-  const where = text.map((c) => c + " like '%FreeUsageLimitError%'").join(" or ");
-  try {
-    const info = db.prepare("delete from " + table.name + " where " + where).run();
-    removed += Number(info.changes || 0);
-  } catch (error) {}
+    if (-not $db) { return @("opencode.db not found") }
+    if (-not (Test-NodeSqlite)) { return @("node 22.5+ required") }
+    $helper = Join-Path $script:Root "lib\db-tools.js"
+    if (-not (Test-Path $helper)) { return @("missing helper: " + $helper) }
+    $nodeArgs = @($Action, $db)
+    if ($Argument) { $nodeArgs += $Argument }
+    $raw = Invoke-NodeHelper $helper $nodeArgs
+    if (-not $raw) { return @("no output from " + $helper) }
+    return @($raw -split "`r?`n" | Where-Object { $_.Trim() })
 }
-console.log("stuck limit rows removed: " + removed);
-'@
-    $out = Invoke-NodeScript $source @($db)
+
+function Remove-StuckErrors([string]$Directory) {
+    $scope = if ($Directory) { ConvertTo-DbPath $Directory } else { "" }
+    $out = Invoke-DbTool "clear" $scope
     if ($out) { Write-Info ($out -join " ") }
 }
 
@@ -475,9 +685,10 @@ function Install-SlashCommand {
         "opencode-unlimited"       = @{ Args = "status"; Desc = "OpenCode free-tier helper - project id, egress ip, bucket" }
         "opencode-unlimited:test"  = @{ Args = "test"; Desc = "check the free bucket on this IP (free)" }
         "opencode-unlimited:reset" = @{ Args = "reset"; Desc = "rotate a project (path optional), clear stuck limit errors" }
+        "opencode-unlimited:clear" = @{ Args = "clear"; Desc = "strip stored free-limit errors from sessions" }
         "opencode-unlimited:id"    = @{ Args = "id"; Desc = "rotate a project id, pass a folder to pick which" }
     }
-    $argNames = @("opencode-unlimited:reset", "opencode-unlimited:id")
+    $argNames = @("opencode-unlimited:reset", "opencode-unlimited:clear", "opencode-unlimited:id")
 
     $cfgPath = Join-Path $script:ConfigDir "opencode.jsonc"
     if (-not (Test-Path $cfgPath)) { $cfgPath = Join-Path $script:ConfigDir "opencode.json" }
@@ -651,12 +862,13 @@ function Test-IsAdmin {
 
 function Cmd-Install {
     Write-Step "==> installing opencode-unlimited"
-    Install-Plugin
     Install-SlashCommand
     $cfg = Get-Config
     $org = Get-OrgId $cfg
     if ($org) { Write-Ok "org id discovered: $org" } else { Write-Warn2 "org id not discovered yet, run opencode once and retry" }
     Save-Config $cfg
+
+    Remove-StaleInstalls
 
     $binDir = $script:ScriptDir
     $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -670,9 +882,14 @@ function Cmd-Install {
         Write-Info "already on PATH: $binDir"
     }
 
-    if (-not (Get-Identity)) { New-Identity | Out-Null }
+    if (Test-Path $script:PluginFile) {
+        Write-Warn2 "an old header plugin is still present"
+        Write-Info "remove it with: opencode-unlimited off"
+    } else {
+        Write-Ok "header plugin not installed (it does not change the quota)"
+    }
     Write-Step ""
-    Write-Ok "done. try: opencode-unlimited status"
+    Write-Ok "done. try: opencode-unlimited usage"
 }
 
 function Get-PathArg {
@@ -708,6 +925,138 @@ function Cmd-Id {
     Write-Ok "identity rotated"
 }
 
+function Get-StaleInstalls {
+    $root = (Resolve-Path $script:Root).ProviderPath.TrimEnd("\")
+    $entries = @()
+    $reg = (Get-ItemProperty "HKCU:\Environment" -Name Path -ErrorAction SilentlyContinue).Path
+    foreach ($value in @($reg, $env:PATH)) {
+        if (-not $value) { continue }
+        foreach ($entry in ($value -split ";")) {
+            $clean = $entry.Trim().TrimEnd("\")
+            if (-not $clean) { continue }
+            if ($clean -ieq $root -or $clean -ieq (Join-Path $root "bin")) { continue }
+            $script = Join-Path $clean "opencode-unlimited.ps1"
+            $isOurDir = (Split-Path -Leaf $clean) -ieq "bin" -and (Split-Path -Leaf (Split-Path -Parent $clean)) -match "unlimited"
+            if (-not (Test-Path $script) -and -not $isOurDir) { continue }
+            if ($entries -notcontains $clean) { $entries += $clean }
+        }
+    }
+    return $entries
+}
+
+function Remove-StaleInstalls {
+    $stale = Get-StaleInstalls
+    if (-not $stale) { return }
+    $reg = (Get-ItemProperty "HKCU:\Environment" -Name Path -ErrorAction SilentlyContinue).Path
+    if (-not $reg) { return }
+    $keep = @()
+    foreach ($entry in ($reg -split ";")) {
+        $clean = $entry.Trim().TrimEnd("\")
+        if ($clean -and ($stale -contains $clean)) { continue }
+        if ($entry.Trim()) { $keep += $entry.Trim() }
+    }
+    [System.Environment]::SetEnvironmentVariable("Path", ($keep -join ";"), "User")
+    Write-Ok ("removed stale path entries: " + ($stale -join ", "))
+}
+
+function Cmd-Verify([switch]$Fix) {
+    Write-Step "==> checking session integrity"
+    $fix = $Fix.IsPresent -or ($Rest -contains "-fix") -or ($Rest -contains "--fix")
+    $out = Invoke-DbTool "verify" $(if ($fix) { "fix" } else { "" })
+    $found = $false
+    foreach ($line in @($out)) {
+        $text = ([string]$line).Trim()
+        if (-not $text) { continue }
+        if ($text -match "^no problems") { Write-Ok $text }
+        elseif ($text -match "fixed [1-9]") { Write-Ok $text }
+        elseif ($text -match "^(opencode\.db|node 22|node not|missing helper|schema)") { Write-Bad $text; $found = $true }
+        else { Write-Warn2 $text; $found = $true }
+    }
+    if (-not $fix -and $found) { Write-Info "run with -fix to repair the listed items" }
+}
+
+function Cmd-Clear {
+    Write-Step "==> clearing stored limit errors"
+    $target = Get-PathArg
+    if ($target) {
+        Write-Info ("scope: " + $target)
+        Remove-StuckErrors $target
+    } else {
+        Write-Info "scope: every session"
+        Remove-StuckErrors
+    }
+    Write-Info "the banner comes from stored error rows, not from the server"
+    Write-Info "if a new prompt still fails, your egress ip is still on the spent bucket"
+}
+
+function Cmd-Repair {
+    Write-Step "==> repairing project mappings"
+    $db = Get-DatabasePath
+    if (-not $db) { Write-Bad "opencode.db not found"; return }
+    if (-not (Test-NodeSqlite)) { Write-Bad "node 22.5+ required"; return }
+    $source = @'
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.argv[2]);
+const one = (sql, ...a) => db.prepare(sql).get(...a);
+const norm = (v) => String(v || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+
+const projectDirs = db.prepare("select project_id, directory from project_directory").all();
+const sessionDirs = db.prepare("select project_id, directory, count(*) c from session_v2 group by project_id, directory").all();
+
+const byDir = new Map();
+for (const row of sessionDirs) {
+  const key = norm(row.directory);
+  if (!key) continue;
+  const entry = byDir.get(key) || { owners: new Map(), directory: norm(row.directory) };
+  entry.owners.set(row.project_id, (entry.owners.get(row.project_id) || 0) + row.c);
+  byDir.set(key, entry);
+}
+
+let merged = 0;
+let relinked = 0;
+db.exec("begin");
+db.exec("pragma defer_foreign_keys = ON");
+
+for (const [key, entry] of byDir) {
+  const owners = [...entry.owners.entries()].filter(([id]) => id !== "global").sort((a, b) => b[1] - a[1]);
+  if (!owners.length) continue;
+  const keep = owners[0][0];
+  const linked = projectDirs.filter((row) => norm(row.directory) === key);
+  const linkedIds = new Set(linked.map((row) => row.project_id));
+
+  if (!linkedIds.has(keep)) {
+    db.prepare("delete from project_directory where lower(replace(directory, char(92), '/')) = ?").run(key);
+    db.prepare("insert into project_directory (project_id, directory, time_created) values (?, ?, ?)").run(keep, entry.directory, Date.now());
+    relinked += 1;
+  }
+
+  for (const [other] of owners.slice(1)) {
+    if (other === keep) continue;
+    const count = one("select count(*) c from session_v2 where project_id = ?", other).c;
+    if (count) continue;
+    if (one("select count(*) c from project where id = ?", other).c === 0) continue;
+    db.prepare("update project_directory set project_id = ? where project_id = ?").run(keep, other);
+    db.prepare("update worktree set project_id = ? where project_id = ?").run(keep, other);
+    db.prepare("delete from project where id = ?").run(other);
+    merged += 1;
+  }
+}
+
+const loose = db.prepare("select id from project where id != 'global' and id not in (select project_id from project_directory) and id not in (select project_id from session_v2)").all();
+for (const row of loose) {
+  db.prepare("delete from project where id = ?").run(row.id);
+  merged += 1;
+}
+
+db.exec("commit");
+const orphans = one("select count(*) c from session_v2 where project_id not in (select id from project)").c;
+const dupes = db.prepare("select lower(directory) d, count(*) c from project_directory group by d having c > 1").all().length;
+console.log("mappings fixed: " + (merged + relinked) + ", orphan sessions: " + orphans + ", duplicate directories: " + dupes);
+'@
+    $out = Invoke-NodeScript $source @($db)
+    if ($out) { Write-Ok ($out -join " ") }
+}
+
 function Cmd-Reset {
     Write-Step "==> full reset"
     $cfg = Get-Config
@@ -725,7 +1074,8 @@ function Cmd-Reset {
     } else {
         Write-Info "database rows untouched, sessions stay on the old id"
     }
-    Remove-StuckErrors
+    Remove-StuckErrors $target
+    Cmd-Verify -Fix
 
     Write-Step "[2/4] proxy path"
     if ($cfg.proxy) {
@@ -750,18 +1100,22 @@ function Cmd-Reset {
     $probe = Invoke-QuotaProbe $cfg
     $cfg.lastBucket = $probe.State
     Save-Config $cfg
-    if ($probe.State -eq "fresh") {
-        Write-Ok (Get-BucketLabel $probe.State)
+    if ($probe.State -eq "open") {
+        Write-Ok (Get-BucketLabel $probe)
     } else {
-        Write-Warn2 (Get-BucketLabel $probe.State)
+        Write-Warn2 (Get-BucketLabel $probe)
     }
     Write-Info "a prompt that works is the real signal, or: opencode-unlimited test -live"
     Write-Step ""
     Write-Ok "reset complete"
     Write-Info ("project id: " + $identity.projectId)
+    Write-Info "if a new prompt still refuses: your egress ip is on the spent bucket"
+    Write-Info "change the connection, then: opencode-unlimited clear"
 }
 
 function Get-OpenCodeExe {
+    $info = Get-OpenCodeInfo
+    if ($info.exe -and (Test-Path $info.exe) -and $info.exe -like "*.exe") { return $info.exe }
     $cmd = Get-Command opencode -ErrorAction SilentlyContinue
     $candidates = @()
     if ($cmd) {
@@ -776,19 +1130,31 @@ function Get-OpenCodeExe {
     return "opencode"
 }
 
+function Get-UserAgent {
+    $info = Get-OpenCodeInfo
+    $version = if ($info.version) { $info.version } else { "latest" }
+    return "opencode/latest/" + $version + "/cli"
+}
+
+function Test-LimitOutput([string]$Text) {
+    if (-not $Text) { return $false }
+    return ($Text -match "FreeUsageLimit|Free usage limit|free messages|free tier")
+}
+
 function Cmd-Test {
     $cfg = Get-Config
     if ($Rest -contains "-live" -or $Rest -contains "--live") {
         $oc = Get-OpenCodeExe
-        $model = $cfg.model
-        if ($model -notmatch "/") { $model = "opencode/" + $model }
+        $info = Get-OpenCodeInfo
+        $model = "opencode/" + (Resolve-ProbeModel $cfg $info)
         Write-Step "==> live check through the app (uses one message)"
+        Write-Info ("model: " + $model)
         $previous = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         $out = (& $oc run -m $model "reply with: ok" 2>&1 | Out-String)
         $code = $LASTEXITCODE
         $ErrorActionPreference = $previous
-        if ($out -match "Free usage limit reached|used today's free messages") {
+        if (Test-LimitOutput $out) {
             Write-Bad "EMPTY - the app itself is blocked on this connection"
             return
         }
@@ -807,18 +1173,126 @@ function Cmd-Test {
     $cfg.lastBucket = $probe.State
     $cfg.lastIp = $ip
     Save-Config $cfg
-    if ($probe.State -eq "fresh") {
-        Write-Ok (Get-BucketLabel $probe.State)
+    if ($probe.State -eq "open") {
+        Write-Ok (Get-BucketLabel $probe)
     } else {
-        Write-Warn2 (Get-BucketLabel $probe.State)
+        Write-Warn2 (Get-BucketLabel $probe)
     }
-    Write-Info "the app has its own quota; a prompt that works means you are fine"
+    Write-Info "the app leaves from the same address, a prompt that works means you are fine"
     Write-Info "real answer: opencode-unlimited test -live"
+}
+
+function Cmd-Usage {
+    $cfg = Get-Config
+    Write-Step "==> free tier check"
+    $ip = Get-EgressIp $cfg.proxy -Force
+    Write-Info ("egress ip : " + $(if ($ip) { $ip } else { "unknown" }))
+    $probe = Invoke-QuotaProbe $cfg
+    $cfg.lastBucket = $probe.State
+    $cfg.lastIp = $ip
+    Save-Config $cfg
+    if ($probe.State -eq "open") {
+        Write-Ok (Get-BucketLabel $probe)
+        Write-Info "a heavy session replays more tokens than a fresh one"
+        Write-Info "if a big session refuses while a fresh one works, it is cost, not identity"
+    } else {
+        Write-Warn2 (Get-BucketLabel $probe)
+        Write-Info "free tier is metered per source address, not per project"
+        Write-Info "rotating the project id or session id does not refill it"
+        Write-Info "change your egress ip, or wait for the reset above"
+    }
+}
+
+function Cmd-Reid {
+    Write-Step "==> minting a fresh session id"
+    $db = Get-DatabasePath
+    if (-not $db) { Write-Bad "opencode.db not found"; return }
+    if (-not (Test-NodeSqlite)) { Write-Bad "node 22.5+ required"; return }
+    $helper = Join-Path $script:Root "lib\session-reid.js"
+    if (-not (Test-Path $helper)) { Write-Bad ("missing helper: " + $helper); return }
+
+    $target = Get-PathArg
+    if (-not $target) {
+        Write-Bad "name a session id"
+        Write-Info "opencode-unlimited reid ses_abc123..."
+        Write-Info "opencode-unlimited sessions \"C:\path\to\project\" lists the ids"
+        return
+    }
+
+    if ($target -notlike "ses_*") {
+        Write-Bad "reid needs a session id, not a folder"
+        Write-Info ("try: opencode-unlimited sessions `"" + $target + "`"")
+        return
+    }
+
+    $raw = Invoke-NodeHelper $helper @($db, "reid", $target)
+    $result = $null
+    try { $result = $raw | ConvertFrom-Json } catch { $result = $null }
+    if (-not $result -or -not $result.newId -or $result.error) {
+        Write-Bad "reid failed"
+        $reason = if ($result -and $result.error) { [string]$result.error } else { ($raw -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join " " }
+        Write-Info $reason
+        return
+    }
+
+    Write-Ok ("old id : " + $result.oldId)
+    Write-Ok ("new id : " + $result.newId)
+    Write-Info ("table  : " + $result.sessionTable)
+    Write-Info ("rows   : " + $result.moved)
+    foreach ($item in @($result.touched)) { if ($item) { Write-Info ("moved  : " + $item) } }
+    Write-Info "open the new id in the app, the messages are all there"
+    Write-Info "reid does not refill the quota, it only breaks a fork chain"
+}
+
+function Cmd-Sessions {
+    $db = Get-DatabasePath
+    if (-not $db) { Write-Bad "opencode.db not found"; return }
+    if (-not (Test-NodeSqlite)) { Write-Bad "node 22.5+ required"; return }
+    $helper = Join-Path $script:Root "lib\session-reid.js"
+    if (-not (Test-Path $helper)) { Write-Bad ("missing helper: " + $helper); return }
+    $target = Get-PathArg
+    $cmdArgs = @($db, "list")
+    if ($target) { $cmdArgs += $target }
+    $raw = Invoke-NodeHelper $helper $cmdArgs
+    $rows = @()
+    try { $rows = @($raw | ConvertFrom-Json) } catch { $rows = @() }
+    if ($rows.Count -eq 0) {
+        Write-Warn2 "no sessions found"
+        return
+    }
+    $schema = ""
+    $info = Get-OpenCodeInfo
+    if ($info.sessionTable) { $schema = $info.sessionTable }
+    Write-Step ("==> sessions (" + $rows.Count + ")" + $(if ($schema) { ", table " + $schema } else { "" }))
+    foreach ($row in $rows) {
+        $title = [string]$row.title
+        if (-not $title) { $title = "(untitled)" }
+        if ($title.Length -gt 42) { $title = $title.Substring(0, 42) }
+        $when = ""
+        if ($row.updated -gt 0) {
+            $when = ([DateTimeOffset]::FromUnixTimeMilliseconds([int64]$row.updated)).ToLocalTime().ToString("M/d HH:mm")
+        }
+        Write-Info ($row.id + "  " + $when.PadRight(12) + "  " + $title)
+    }
 }
 
 function Cmd-Status {
     $cfg = Get-Config
+    $info = Get-OpenCodeInfo
     Write-Step "==> opencode-unlimited status"
+    Write-Step ""
+    Write-Step "runtime"
+    $versionText = if ($info.version) { "v" + $info.version } else { "not detected" }
+    if ($info.api) { $versionText += "  (api v" + $info.api + ")" }
+    Write-Info ("opencode   : " + $versionText)
+    Write-Info ("binary     : " + $info.exe)
+    Write-Info ("service    : " + $(if ($info.running) { "running" } else { "not running (start the app once)" }))
+    Write-Info ("gateway    : " + $info.gateway)
+    Write-Info ("database   : " + $(if ($info.dbPath) { $info.dbPath } else { "not found" }))
+    Write-Info ("session t. : " + $(if ($info.sessionTable) { $info.sessionTable } else { "unknown" }))
+    if (@($info.freeModels).Count -gt 0) {
+        Write-Info ("free models: " + @($info.freeModels).Count + " listed, default " + $info.freeModel)
+    }
     Write-Step ""
     Write-Step "identity"
     $id = Get-Identity
@@ -853,10 +1327,10 @@ function Cmd-Status {
     $ip = Get-EgressIp $cfg.proxy
     $cfg.lastIp = $ip
     Save-Config $cfg
-    if ($probe.State -eq "fresh") {
-        Write-Ok (Get-BucketLabel $probe.State)
+    if ($probe.State -eq "open") {
+        Write-Ok (Get-BucketLabel $probe)
     } else {
-        Write-Warn2 (Get-BucketLabel $probe.State)
+        Write-Warn2 (Get-BucketLabel $probe)
     }
     Write-Info "app quota   : not measured here, see: opencode-unlimited test -live"
 }
@@ -971,7 +1445,7 @@ function Cmd-Run {
     while ($attempt -le 3) {
         $out = & $oc @Rest 2>&1 | Out-String
         $code = $LASTEXITCODE
-        if ($out -match "Free usage limit reached|used today's free messages") {
+        if (Test-LimitOutput $out) {
             Write-Warn2 ("free limit hit (attempt " + $attempt + "/3)")
             Cmd-Id | Out-Null
             $cfg = Get-Config
@@ -1003,21 +1477,35 @@ function Cmd-Doctor {
         Write-Warn2 "node       : not found (proxy bridge and -Db need it)"
     }
     if (Get-Curl) { Write-Ok "curl       : found" } else { Write-Warn2 "curl       : missing, using .NET fallback" }
-    $oc = Resolve-OpenCode
-    Write-Info ("opencode   : " + $oc)
-    $exe = Get-OpenCodeExe
-    $info = & $exe api get /api/info 2>$null | Out-String
-    $version = [regex]::Match($info, '"version":"[^"]+"').Value
-    if ($version) {
-        Write-Ok ("service    : running, " + $version)
+    Write-Info ("tool       : " + $PSCommandPath)
+    $stale = Get-StaleInstalls
+    if ($stale) {
+        Write-Warn2 ("stale copy : " + ($stale -join ", "))
+        Write-Info "this is why an old version can answer instead of this one"
+        Write-Info "fix: opencode-unlimited install"
+    } else {
+        Write-Ok "stale copy : none"
+    }
+    $ocInfo = Get-OpenCodeInfo
+    Write-Info ("opencode   : " + $ocInfo.exe)
+    if ($ocInfo.version) {
+        Write-Ok ("version    : v" + $ocInfo.version + $(if ($ocInfo.api) { " (api v" + $ocInfo.api + ")" } else { "" }))
+    } else {
+        Write-Warn2 "version    : not detected, is opencode on PATH?"
+    }
+    if ($ocInfo.running) {
+        Write-Ok "service    : running"
     } else {
         Write-Warn2 "service    : not reachable, start opencode once"
     }
-    $loaded = & $exe api get /api/plugin 2>$null | Out-String
-    if ($loaded -match '"id":"unlimited-shield"') {
-        if ($loaded -match '"id":"unlimited-shield".{0,200}?"status":"active"') { Write-Ok "plugin     : loaded and active" } else { Write-Warn2 "plugin     : loaded but not active" }
+    Write-Info ("gateway    : " + $ocInfo.gateway)
+    Write-Info ("database   : " + $(if ($ocInfo.dbPath) { $ocInfo.dbPath } else { "not found" }))
+    Write-Info ("session t. : " + $(if ($ocInfo.sessionTable) { $ocInfo.sessionTable } else { "unknown" }))
+    $pluginApi = & $ocInfo.exe api get /api/plugin 2>$null | Out-String
+    if ($pluginApi -match '"id":"unlimited-shield"') {
+        if ($pluginApi -match '"id":"unlimited-shield".{0,200}?"status":"active"') { Write-Ok "plugin     : loaded and active" } else { Write-Warn2 "plugin     : loaded but not active" }
     } else {
-        Write-Warn2 "plugin     : not loaded, run: opencode-unlimited install"
+        Write-Warn2 "plugin     : not loaded (optional, it does not change the quota)"
     }
     $id = Get-Identity
     if ($id -and $id.projectId -match "^[0-9a-f]{40}$") { Write-Ok ("identity   : " + $id.projectId) } else { Write-Warn2 "identity   : missing or invalid, run: opencode-unlimited id" }
@@ -1058,36 +1546,63 @@ function Cmd-Uninstall {
     Set-ServiceEnv "ALL_PROXY" ""
     Write-Ok "service proxy cleared"
     Remove-Item $script:StateFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $script:InfoFile -Force -ErrorAction SilentlyContinue
     Remove-Item $script:PidFile -Force -ErrorAction SilentlyContinue
     Remove-Item $script:LogFile -Force -ErrorAction SilentlyContinue
     Write-Ok "state files removed"
     Write-Info ("repo and PATH entry kept, delete manually if you want: " + $script:Root)
 }
 
+function Cmd-Version {
+    $info = Get-OpenCodeInfo
+    Write-Step ("opencode-unlimited " + $script:ToolVersion)
+    Write-Info ("opencode   : " + $(if ($info.version) { "v" + $info.version } else { "not detected" }))
+    Write-Info ("api        : " + $(if ($info.api) { "v" + $info.api } else { "unknown" }))
+    Write-Info ("session t. : " + $(if ($info.sessionTable) { $info.sessionTable } else { "unknown" }))
+    Write-Info ("gateway    : " + $info.gateway)
+}
+
 function Cmd-Help {
     Write-Step "opencode-unlimited <command>"
     Write-Step ""
-    Write-Info "install              deploy plugin, register PATH, write state"
+    Write-Info "usage                is the free tier open on this connection"
+    Write-Info "sessions [path]      list sessions and their ids for a folder"
+    Write-Info "reid <session-id>    mint a fresh session id, keep every message"
+    Write-Info "version              tool version plus the detected opencode version"
+    Write-Step ""
+    Write-Info "install              register PATH, install the slash command"
     Write-Info "reset [path] [-Db]   rotate a project, clear stuck errors, verify"
     Write-Info "id [path] [-Db]      rotate the header id, or one project by folder"
+    Write-Info "clear [path]         strip stored free-limit errors, no rotation"
+    Write-Info "repair               re-link projects to the sessions they own"
+    Write-Info "verify [-fix]        check sessions decode, no dangling state"
     Write-Info "test [-live]         direct probe (free) or a real app check (costs 1 message)"
-    Write-Info "status               identity, plugin, network, bucket"
+    Write-Info "status               runtime, identity, network, bucket"
     Write-Info "on | off             enable or disable the identity plugin"
     Write-Info "proxy set <url>      route opencode through socks5:// or http://"
     Write-Info "proxy off            drop the upstream, direct egress"
     Write-Info "proxy status         show the current upstream"
     Write-Info "warp on|off|rotate   Cloudflare WARP path (optional)"
     Write-Info "run <args...>        run opencode, rotate on free-limit"
-    Write-Info "doctor               check node, service, plugin, identity"
+    Write-Info "doctor               check node, service, schema, identity"
     Write-Info "uninstall            remove plugin, slash commands, state"
 }
 
 switch ($Command.ToLowerInvariant()) {
     "install" { Cmd-Install }
     "reset" { Cmd-Reset }
+    "clear" { Cmd-Clear }
+    "repair" { Cmd-Repair }
+    "verify" { Cmd-Verify }
     "id" { Cmd-Id }
     "test" { Cmd-Test }
+    "usage" { Cmd-Usage }
     "status" { Cmd-Status }
+    "sessions" { Cmd-Sessions }
+    "reid" { Cmd-Reid }
+    "version" { Cmd-Version }
+    "-v" { Cmd-Version }
+    "--version" { Cmd-Version }
     "on" { Cmd-On }
     "off" { Cmd-Off }
     "proxy" { Cmd-Proxy }

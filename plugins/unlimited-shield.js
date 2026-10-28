@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -9,14 +10,36 @@ const IDENTITY_PATHS = [
   join(homedir(), ".opencode", "identity.json"),
 ].filter(Boolean)
 
-const PROJECT_ID_RE = /^[0-9a-f]{40}$/
-const MTIME_CHECK_MS = 1000
+const STATE_PATHS = [
+  process.env.OPENCODE_UNLIMITED_STATE || "",
+  join(homedir(), ".config", "opencode", "unlimited.json"),
+  process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "opencode", "unlimited.json") : "",
+].filter(Boolean)
 
-let cachedId = null
-let cachedPath = null
-let cachedMtime = 0
-let lastStat = 0
-let warnedMissing = false
+const PROJECT_ID_RE = /^[0-9a-f]{40}$/
+const CACHE_MS = 1000
+
+const SESSION_HEADERS = [
+  "x-opencode-session-id",
+  "x-opencode-session",
+  "x-session-affinity",
+  "X-Session-Id",
+]
+
+let identityId = null
+let identityPath = null
+let identityMtime = 0
+let identityStat = 0
+let identityWarned = false
+
+let stateSalt = ""
+let stateEnabled = true
+let stateOverrides = {}
+let statePath = null
+let stateMtime = 0
+let stateStat = 0
+
+const affinityCache = new Map()
 
 function emit(ctx, level, message, extra) {
   try {
@@ -37,7 +60,7 @@ function readIdentity() {
       continue
     }
     if (!stat.isFile()) continue
-    if (file === cachedPath && stat.mtimeMs === cachedMtime && cachedId) return cachedId
+    if (file === identityPath && stat.mtimeMs === identityMtime && identityId) return identityId
 
     let parsed
     try {
@@ -48,42 +71,103 @@ function readIdentity() {
     const raw = typeof parsed?.projectId === "string" ? parsed.projectId.trim().toLowerCase() : ""
     if (!PROJECT_ID_RE.test(raw)) continue
 
-    cachedId = raw
-    cachedPath = file
-    cachedMtime = stat.mtimeMs
+    identityId = raw
+    identityPath = file
+    identityMtime = stat.mtimeMs
     return raw
   }
   return null
 }
 
-function currentProjectId() {
-  const now = Date.now()
-  if (cachedId && now - lastStat < MTIME_CHECK_MS) return cachedId
-  lastStat = now
-  return readIdentity() ?? cachedId
+function readState() {
+  for (const file of STATE_PATHS) {
+    let stat
+    try {
+      stat = statSync(file)
+    } catch {
+      continue
+    }
+    if (!stat.isFile()) continue
+    if (file === statePath && stat.mtimeMs === stateMtime) return
+
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""))
+    } catch {
+      continue
+    }
+    const affinity = parsed?.affinity
+    stateEnabled = affinity?.enabled !== false
+    stateSalt = typeof affinity?.salt === "string" ? affinity.salt : ""
+    const map = affinity?.overrides
+    stateOverrides = map && typeof map === "object" ? map : {}
+    statePath = file
+    stateMtime = stat.mtimeMs
+    affinityCache.clear()
+    return
+  }
 }
 
-function applyHeaders(target, ctx) {
+function currentProjectId() {
+  const now = Date.now()
+  if (identityId && now - identityStat < CACHE_MS) return identityId
+  identityStat = now
+  return readIdentity() ?? identityId
+}
+
+function currentState() {
+  const now = Date.now()
+  if (now - stateStat >= CACHE_MS) {
+    stateStat = now
+    readState()
+  }
+}
+
+function syntheticAffinity(sessionID) {
+  const override = stateOverrides[sessionID]
+  const seed = typeof override === "string" && override.slice(0, 4) === "ses_" ? override : `${sessionID}\u0000${stateSalt}`
+  const cached = affinityCache.get(seed)
+  if (cached) return cached
+  const digest = createHash("sha256").update(seed).digest("hex")
+  const value = "ses_" + digest
+  if (affinityCache.size > 4096) affinityCache.clear()
+  affinityCache.set(seed, value)
+  return value
+}
+
+function setHeader(headers, name, value) {
+  if (typeof headers?.set === "function") {
+    headers.set(name, value)
+    return
+  }
+  if (!headers || typeof headers !== "object") return
+  const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase())
+  if (existing) {
+    headers[existing] = value
+    return
+  }
+  headers[name] = value
+}
+
+function applyHeaders(headers, sessionID, ctx) {
   try {
-    const id = currentProjectId()
-    if (!id) {
-      if (!warnedMissing) {
-        warnedMissing = true
+    const projectId = currentProjectId()
+    if (!projectId) {
+      if (!identityWarned) {
+        identityWarned = true
         emit(ctx, "warn", "identity.json missing or invalid; x-opencode-project untouched", {
           looked: IDENTITY_PATHS,
         })
       }
-      return
+    } else {
+      identityWarned = false
+      setHeader(headers, "x-opencode-project", projectId)
     }
-    warnedMissing = false
 
-    if (target && typeof target.set === "function") {
-      target.set("x-opencode-project", id)
-      return
-    }
-    if (target && typeof target === "object") {
-      target["x-opencode-project"] = id
-    }
+    currentState()
+    if (!stateEnabled || !stateSalt || !sessionID) return
+    const affinity = syntheticAffinity(sessionID)
+    for (const name of SESSION_HEADERS) setHeader(headers, name, affinity)
   } catch (error) {
     emit(ctx, "error", "header injection failed", { error: String(error) })
   }
@@ -98,7 +182,7 @@ export default {
     try {
       if (typeof ctx?.session?.hook === "function") {
         await ctx.session.hook("model.request", (event) => {
-          applyHeaders(event?.headers, ctx)
+          applyHeaders(event?.headers, event?.sessionID, ctx)
         })
         registered.push("model.request")
       }
@@ -109,7 +193,8 @@ export default {
     try {
       if (typeof ctx?.session?.hook === "function") {
         await ctx.session.hook("http.request", (event) => {
-          applyHeaders(event?.request?.headers, ctx)
+          const headers = event?.request?.headers
+          applyHeaders(headers, event?.sessionID, ctx)
         })
         registered.push("http.request")
       }
@@ -117,11 +202,11 @@ export default {
       emit(ctx, "warn", "http.request hook unavailable", { error: String(error) })
     }
 
-    const id = currentProjectId()
-    emit(ctx, id ? "info" : "warn", "unlimited-shield loaded", {
-      projectId: id,
+    readState()
+    emit(ctx, "info", "unlimited-shield loaded", {
+      projectId: currentProjectId(),
+      affinity: stateEnabled && stateSalt ? "on" : "off",
       hooks: registered,
-      identityPaths: IDENTITY_PATHS,
     })
   },
 }
