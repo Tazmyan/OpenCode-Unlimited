@@ -1,24 +1,13 @@
 # OpenCode-Unlimited
 
-**Tells you when OpenCode's free messages are back, and fixes the banner that lies about it.**
+Fixes OpenCode's daily free-message limit from the command line: shows the real meter, clears the stale limit banner, rotates a local device id, and moves you onto a fresh network exit when you ask it to. Windows 10/11.
 
-OpenCode gives every connection a free daily budget. When it runs out you get:
+Nothing here writes to your registry, deletes a chat, or loses a message.
 
+```powershell
+opencode-unlimited usage
+opencode-unlimited reset "C:\my\project"
 ```
-You've used today's free messages. They reset at 2:00 AM - 10/27/2026
-```
-
-Two different things are happening when you see that message, and this tool
-separates them:
-
-1. **The live budget** — metered by OpenCode's servers against the address your
-   traffic leaves from. Nothing local can refill it.
-2. **The stored banner** — a failed request was written into the session as an
-   error row, and the app keeps showing it long after the budget reset.
-
-`opencode-unlimited` reads the real state of the budget, clears the stale
-banner without touching your messages, and tells you plainly whether you are
-waiting on the clock or on your IP.
 
 ---
 
@@ -30,78 +19,46 @@ cd OpenCode-Unlimited
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Open a new terminal so the `opencode-unlimited` command is found. No admin
-rights, no changes to your OpenCode config, no proxy is set behind your back.
+Open a new terminal afterwards so `opencode-unlimited` is on PATH.
 
-Requires Windows 10/11 and Node.js 22.5+ (only because the session tools use
-Node's built-in SQLite reader).
+- No admin rights.
+- No registry writes.
+- No proxy set behind your back.
+- No plugin installed unless you run `opencode-unlimited on`.
 
----
-
-## Quick start
-
-```powershell
-opencode-unlimited usage      # is the free tier open on this connection?
-opencode-unlimited clear      # wipe the stored "out of messages" banner
-opencode-unlimited test -live # ask the app for one tiny reply
-```
-
-`usage` answers the only question that matters:
-
-```
-==> free tier check
-      egress ip : 95.42.79.22
-  [!] SPENT - this connection has no free messages left until 1:59 am 10/29/2026
-      free tier is metered per source address, not per project
-      rotating the project id or session id does not refill it
-      change your egress ip, or wait for the reset above
-```
-
-When it says `OPEN`, you can prompt right away.
+Needs Node.js 22.5 or newer, only because the session tools use Node's built-in SQLite reader.
 
 ---
 
-## Why changing the project id does nothing
+## Hit the message limit? Do this
 
-This is the part most guides get wrong.
-
-The free budget is counted against your **source IP**, not against
-`x-opencode-project`, not against your session id, not against your account.
-Three requests with a real project id, a made-up project id, and no project
-header at all return the same `429 FreeUsageLimitError` and the same
-`Retry-After`. The bucket is the address.
-
-So the only real refill is a different connection:
-
-1. Change network — VPN, phone hotspot, router reconnect, new Wi-Fi.
-2. Confirm it moved: `opencode-unlimited status` shows `egress ip`.
-3. `opencode-unlimited clear` to drop the stale banner.
-4. `opencode-unlimited test -live` for a real answer.
-
-If the IP is identical, nothing changed and the limit holds.
-
-The window resets daily at **00:00 UTC** (about 2:00 AM in central Europe). The
-`Retry-After` header carries the exact number of seconds left, and this tool
-turns that into a local clock time.
-
----
-
-## The banner is history, not a live answer
-
-When a prompt is refused, OpenCode stores the failure inside the session as a
-row with `error.type = provider.free-limit`, plus a `retryAfterMs`. Reopening
-that session shows the row again, so an old refusal looks like a fresh one.
-
-`clear` removes exactly those errors and sets the row's outcome back to
-`succeeded`. Rows are never deleted, so no message can end up pointing at a
-missing id, and your chat history stays exactly where it was.
+You get this in the chat:
 
 ```
-limit errors cleared: 24, idle flags reset: 1
+You've used today's free messages. They reset at 2:00 AM - 10/27/2026
 ```
 
-If a **new** prompt still fails after that, the budget itself is spent on that
-connection.
+Step by step:
+
+1. **Close OpenCode.** The desktop app, the TUI, and `opencode serve` if it is running. Anything still open keeps the old connection warm.
+2. **Change your IP.** Pick one:
+   - Disconnect and reconnect your VPN, and pick a different server.
+   - Turn your phone hotspot on and connect to it.
+   - Power-cycle your router until the ISP hands you a new address.
+
+   Check that it actually changed with `opencode-unlimited block` — it prints the address you are leaving from right now.
+3. **Run the reset.**
+
+   ```powershell
+   opencode-unlimited reset "C:\my\project"
+   ```
+
+   That rotates the local device id, removes the stored limit errors, re-ids the sessions in that folder without touching their messages, and switches to the next proxy in your pool if you added one. It also prints the egress address before and after, so you can see whether the IP really moved.
+4. **Open OpenCode again.** The banner is gone and you are on the new block.
+
+If step 3 says `ip unchanged`, step 2 did not work. Same address means same bucket, and that bucket stays spent until 00:00 UTC. Change the connection again, then re-run `reset`.
+
+Do not use a 121 MB chat for the first test message after a reset. A long session replays its whole history, which costs a lot more than a fresh one.
 
 ---
 
@@ -109,109 +66,140 @@ connection.
 
 | Command | What it does |
 |---|---|
-| `opencode-unlimited usage` | Free check: is the budget open on this connection, and when does it reset |
-| `opencode-unlimited test` | Same direct probe, short form |
-| `opencode-unlimited test -live` | Real check through the app. Costs one message |
-| `opencode-unlimited status` | Runtime, identity, network, plugin, budget |
-| `opencode-unlimited version` | Tool version plus the OpenCode version, API version and DB schema it detected |
-| `opencode-unlimited clear` | Strip stored "free limit" errors from every session |
-| `opencode-unlimited clear "C:\path\to\project"` | Same, scoped to one folder |
-| `opencode-unlimited sessions` | List sessions with their ids and folders |
-| `opencode-unlimited sessions "C:\path\to\project"` | List only that folder |
-| `opencode-unlimited reid ses_abc...` | Mint a fresh session id, keep every message |
-| `opencode-unlimited id` | New project id, all projects move to fresh ids |
-| `opencode-unlimited id "C:\path\to\project"` | New project id for one folder |
-| `opencode-unlimited reset` | Rotate every project, clear the stale banner, verify |
-| `opencode-unlimited reset "C:\path\to\project"` | Same, but only that folder |
-| `opencode-unlimited verify` | Check sessions for orphaned rows and invalid state |
-| `opencode-unlimited verify -fix` | Repair what `verify` found |
-| `opencode-unlimited repair` | Re-link projects to the sessions they own |
+| `opencode-unlimited usage` | Meter state for today and the reset clock |
+| `opencode-unlimited usage -check` | Same, plus one real message through the app |
+| `opencode-unlimited block` | Egress addresses seen today and which are spent |
+| `opencode-unlimited block check` | Is the address you are on now still usable |
+| `opencode-unlimited reset` | New device id, clear stored errors, verify |
+| `opencode-unlimited reset "C:\path"` | Same, plus re-id every session in that folder |
+| `opencode-unlimited reset "C:\path" -Dry` | Preview everything, write nothing |
+| `opencode-unlimited reset "C:\path" -KeepIds` | Rotate the device id only |
+| `opencode-unlimited identity` | Show the virtual device id and its generation |
+| `opencode-unlimited identity rotate` | Mint a new virtual device id |
+| `opencode-unlimited identity restore` | Remove the shim file, registry untouched |
+| `opencode-unlimited sessions` | List sessions with ids, folders and sizes |
+| `opencode-unlimited sessions "C:\path"` | Only that folder |
+| `opencode-unlimited reid ses_abc...` | New session id, every message kept |
+| `opencode-unlimited reid "C:\path"` | Re-id every session in that folder |
+| `opencode-unlimited reid "C:\path" -Dry` | Show old ids, sizes and row counts |
+| `opencode-unlimited model` | Providers with credentials and their free models |
+| `opencode-unlimited model provider/model` | Switch this folder |
+| `opencode-unlimited model ses_abc... provider/model` | Switch one session |
+| `opencode-unlimited clear` | Strip stored "free limit" errors everywhere |
+| `opencode-unlimited clear "C:\path"` | Same, scoped to a folder |
+| `opencode-unlimited verify` | Check for orphaned rows and invalid state |
+| `opencode-unlimited verify -fix` | Repair what it found |
+| `opencode-unlimited status` | Runtime, identity, network, ledger |
+| `opencode-unlimited doctor` | Node, service, schema, plugin, egress |
+| `opencode-unlimited version` | Tool version plus detected OpenCode version |
 | `opencode-unlimited proxy set socks5://host:port` | Route OpenCode through a proxy |
 | `opencode-unlimited proxy off` | Back to a direct connection |
+| `opencode-unlimited proxy pool add socks5://host:port` | Queue a proxy for `reset` to cycle to |
+| `opencode-unlimited proxy next` | Jump to the next pooled proxy now |
 | `opencode-unlimited warp on\|off\|rotate` | Optional Cloudflare WARP path |
-| `opencode-unlimited doctor` | Check node, service, schema, identity, plugin |
-| `opencode-unlimited uninstall` | Remove the slash commands and local state |
+| `opencode-unlimited run <args...>` | Run OpenCode, record a free-limit hit |
+| `opencode-unlimited uninstall` | Remove slash commands, plugin and local state |
 
-Inside OpenCode's chat, the same actions as menu commands:
+Inside the chat, the same actions as slash commands:
 
 ```
 opencode-unlimited
-opencode-unlimited:test
+opencode-unlimited:reset C:\Users\you\projects\my-app
+opencode-unlimited:identity rotate
+opencode-unlimited:block
+opencode-unlimited:usage
+opencode-unlimited:reid C:\Users\you\projects\my-app
+opencode-unlimited:model openrouter/deepseek/deepseek-v4.1-flash
 opencode-unlimited:clear C:\Users\you\projects\my-app
-opencode-unlimited:id C:\Users\you\projects\my-app
-opencode-unlimited:reset
 ```
+
+Colon separator, so they sort together and do not collide with other plugins.
 
 ---
 
-## Sessions are never damaged
+## The limit is per IP, not per account or device
 
-Everything lives in `opencode.db`.
+The free budget is counted per egress block, per UTC day:
 
-- `clear` and `verify -fix` only rewrite the rows they name. Nothing is deleted.
-- `reid` moves one session to a new id and re-points every child row inside one
-  transaction. On any error it rolls back, so a half-moved session cannot exist.
-- `reset` rewrites project ids; sessions, messages and history follow the new id
-  and stay attached to their folder.
-- Restarting the background service never touches sessions.
+- IPv4: one address, `/32`
+- IPv6: one prefix, `/64`
+- Resets at exactly **00:00 UTC** — 2:00 AM in central Europe, 1:00 AM in the UK, 7:00 PM the previous day on the US east coast.
+
+It is not per project, not per session, not per model, not per device and not per machine id. Rotating `x-opencode-project` or the session id changes nothing. The refusal is about the address you leave from.
+
+So the two honest levers are:
+
+1. Leave through a different address block — VPN, hotspot, router reconnect, or `proxy pool`.
+2. Switch the session to a provider that does not bill through this gateway: `opencode-unlimited model`.
+
+The window is a wall clock, not a rolling one. `Retry-After` always lands on the next midnight UTC.
 
 ---
 
-## Works across OpenCode versions
+## Proxy pool
 
-Nothing about versions is hardcoded. On every run the tool detects:
+Manual IP changes work fine. If you have a few proxies and want `reset` to walk them for you:
 
-- the `opencode` binary (PATH, npm global, bun, scoop, chocolatey, local install)
-- its version from `--version`, the running service, or the package manifest
-- the API generation from your `cli.json` schema (`v1`, `v2`, …)
-- the gateway base URL and org id from the provider list, falling back to the
-  known default when the service is not running
-- the free models that exist right now, so probes always use a model you can
-  actually reach
-- the database location (XDG, `OPENCODE_DATA_HOME`, `%LOCALAPPDATA%`) and the
-  live schema — the session table, message table, id columns and fork columns
-  are discovered, not assumed
-
-```
-opencode-unlimited version
-opencode-unlimited 1.0.1
-      opencode   : v2.1.4
-      api        : v2
-      session t. : session_v2
-      gateway    : https://opencode.ai/inference/openai/v1/chat/completions
+```powershell
+opencode-unlimited proxy pool add socks5://127.0.0.1:1080
+opencode-unlimited proxy pool add http://user:pass@10.0.0.1:3128
+opencode-unlimited proxy pool
 ```
 
-Detected values are cached for five minutes in
-`~/.config/opencode/unlimited-info.json`. Delete it, or pass `status`, to
-refresh.
+From then on, `reset` moves to the next entry, applies it, restarts the background service, and measures the exit address. If the new address is the same as the old one, it tries the next proxy instead of pretending it worked. It gives up after the pool size or eight attempts, whichever is smaller, and says so.
+
+```powershell
+opencode-unlimited proxy next        # walk one step now
+opencode-unlimited proxy pool clear  # forget the pool
+```
+
+SOCKS5 proxies go through a small local bridge, because the OpenCode service speaks HTTP proxies. HTTP proxies are used directly. Proxies are never set globally on the machine — only in the service environment.
+
+---
+
+## What `reset` rotates, and what it refuses to touch
+
+`reset` does six things:
+
+1. **Device id** — a virtual id stored in `~/.config/opencode/unlimited-identity.json` and `%LOCALAPPDATA%\opencode-unlimited\shim\machine-guid.txt`. It **never** writes `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`. `identity restore` deletes the shim and your real machine guid is still exactly where it was.
+2. **Stored limit errors** — removes the `provider.free-limit` rows a failed prompt left in your history, and flips the session outcome back to succeeded. No rows deleted.
+3. **Session ids** — one transaction per session, every message and part row re-pointed, row counts compared before and after, rollback on mismatch.
+4. **Egress route** — next proxy in the pool, if you have one.
+5. **Egress block** — measures the address you are leaving from and records it in a local ledger.
+6. **Database** — `verify -fix`: invalid idle flags, duplicate project folders.
+
+Restarting the background service never touches sessions. `clear` never deletes a session or a message row. A re-id is not a refill; it gives the session a clean new identity and keeps its content.
 
 ---
 
 ## Troubleshooting
 
-**`usage` says SPENT but messages still work.**
-Remaining budget is not linear: a long session replays its whole history, so a
-heavy chat can burn far more than an empty one. If a fresh session works and the
-old one does not, it is cost, not identity. `test -live` on the empty session is
-the honest check.
+**`usage` says the block is spent but prompts still work.**
+Remaining budget is not linear. A long session replays its whole history, so a heavy chat can burn dozens of calls for one visible turn while a fresh session still gets through.
 
-**The banner still shows after `clear`.**
+**The banner is still there after `clear`.**
 Restart the app so the session reloads from disk.
 
-**`sessions` prints nothing.**
-Check `opencode-unlimited doctor` — it prints the database path and the detected
-session table.
+**`reset` says `ip unchanged`.**
+Your VPN, hotspot, or router handed you the same address. Same block, same bucket. Change the connection and run it again, or wait for 00:00 UTC.
+
+**`sessions` prints nothing for a folder.**
+Run `opencode-unlimited doctor`. It prints the database path and the detected session table. Folder matching ignores case and slash direction.
+
+**A re-id felt slow on a big folder.**
+Each session is its own transaction and the history is rewritten in place. A 200 MB folder takes a few seconds. Use `-Dry` first.
 
 **Everything looks fine but prompts fail.**
-`opencode-unlimited usage` and compare `egress ip` with what your VPN reports.
-Leaking DNS or an IPv6 route can keep you on the old address.
+Compare `opencode-unlimited usage` with the exit address your VPN reports. Leaking DNS or an IPv6 route can keep you on the old block.
+
+**I want my machine id back.**
+Nothing was changed. `opencode-unlimited identity restore` deletes the shim and the state file.
 
 ---
 
 ## Issues and help
 
-Open an issue on GitHub with the command you ran and the output — that is enough
-to start. Pull requests welcome, small ones especially.
+Open an issue with the command you ran and the output. That is enough to start. Small pull requests are welcome.
 
 > [!TIP]
 > Faster answers in the Discord: **https://discord.gg/8RfQBJh5JZ**
@@ -220,15 +208,10 @@ to start. Pull requests welcome, small ones especially.
 
 ## Disclaimer
 
-Educational and research use only. Not affiliated with, endorsed by, or
-supported by OpenCode or any of their partners; all trademarks belong to their
-owners.
+Educational and research use only. Not affiliated with, endorsed by, or supported by OpenCode or any of their partners; all trademarks belong to their owners.
 
-- It unlocks no entitlement. The free limit is enforced by OpenCode's servers and
-  stays in force.
-- Using it may break a provider's terms of service. You are responsible for that
-  and for any consequence, including account restrictions.
-- Provided "as is", with no warranty and no liability for damage, data loss or
-  account action. Use at your own risk.
-- Rights holder and want it gone? Open an issue and it gets removed promptly, no
-  argument.
+- It unlocks no entitlement. The free limit is enforced by OpenCode's servers and stays in force.
+- It does not modify your machine id, your registry, or any system identifier. The identity it rotates is a local file the tool owns.
+- Using it may break a provider's terms of service. That is your responsibility, and so is any consequence, including account restrictions.
+- Provided "as is", with no warranty and no liability for damage, data loss or account action. Use at your own risk.
+- Rights holder and want it gone? Open an issue and it gets removed promptly, no argument.

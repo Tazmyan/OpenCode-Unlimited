@@ -33,7 +33,10 @@ $required = @(
     (Join-Path $root "lib\proxy-bridge.js"),
     (Join-Path $root "lib\oc-info.js"),
     (Join-Path $root "lib\db-tools.js"),
-    (Join-Path $root "lib\session-reid.js")
+    (Join-Path $root "lib\session-reid.js"),
+    (Join-Path $root "lib\identity.js"),
+    (Join-Path $root "lib\egress.js"),
+    (Join-Path $root "lib\model-switch.js")
 )
 foreach ($file in $required) {
     if (-not (Test-Path $file)) { Bad "missing build artifact: $file" }
@@ -41,7 +44,7 @@ foreach ($file in $required) {
 Ok "build artifacts present"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
-if ($node) { Ok "node $((& $node.Source --version).Trim())" } else { Info "node not found: session tools and -Db rotation stay unavailable" }
+if ($node) { Ok "node $((& $node.Source --version).Trim())" } else { Info "node not found: session tools and identity helpers stay unavailable" }
 
 if ($WithPlugin) {
     if (-not (Test-Path $pluginSrc)) { Bad "missing plugin: $pluginSrc" }
@@ -80,9 +83,10 @@ if ($shell) {
 Write-Host ""
 Write-Host "  next:" -ForegroundColor Cyan
 Info "opencode-unlimited version    tool plus the detected opencode version"
-Info "opencode-unlimited usage      is the free tier open on this connection"
-Info "opencode-unlimited status     runtime, identity, network, bucket"
-Info "opencode-unlimited sessions   list sessions and their ids"
+Info "opencode-unlimited usage      what the meter is doing today"
+Info "opencode-unlimited reset .    new device id, new session ids, nothing lost"
+Info "opencode-unlimited model      providers you can switch to"
+Info "opencode-unlimited status     runtime, identity, network, ledger"
 Info "opencode-unlimited proxy set socks5://127.0.0.1:1080   optional IP path"
 Write-Host ""
 Ok "installed"
