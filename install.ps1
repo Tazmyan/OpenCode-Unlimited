@@ -2,8 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [switch]$NoPath,
-    [switch]$WithPlugin
+    [switch]$NoPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +11,6 @@ $root = $PSScriptRoot
 $bin = Join-Path $root "bin"
 $entry = Join-Path $bin "opencode-unlimited.cmd"
 $ps1 = Join-Path $bin "opencode-unlimited.ps1"
-$pluginSrc = Join-Path $root "plugins\unlimited-shield.js"
 
 $userHome = [Environment]::GetFolderPath("UserProfile")
 if (-not $userHome) { $userHome = $env:USERPROFILE }
@@ -36,6 +34,8 @@ $required = @(
     (Join-Path $root "lib\session-reid.js"),
     (Join-Path $root "lib\identity.js"),
     (Join-Path $root "lib\egress.js"),
+    (Join-Path $root "lib\log-watch.js"),
+    (Join-Path $root "lib\proxy-health.js"),
     (Join-Path $root "lib\model-switch.js")
 )
 foreach ($file in $required) {
@@ -46,17 +46,12 @@ Ok "build artifacts present"
 $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node) { Ok "node $((& $node.Source --version).Trim())" } else { Info "node not found: session tools and identity helpers stay unavailable" }
 
-if ($WithPlugin) {
-    if (-not (Test-Path $pluginSrc)) { Bad "missing plugin: $pluginSrc" }
-    if (-not (Test-Path $pluginDir)) { New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null }
-    Copy-Item $pluginSrc $pluginDst -Force
-    Ok "plugin deployed: $pluginDst"
-} elseif (Test-Path $pluginDst) {
-    Warn "an old plugin copy is present: $pluginDst"
-    Info "it rewrites request headers and does not change the quota"
-    Info "remove it with: opencode-unlimited off"
+if (Test-Path $pluginDst) {
+    Warn "an old flat plugin copy is present: $pluginDst"
+    Info "the current layout is a folder, install it with: opencode-unlimited plugin install"
+    Info "remove the old file with: opencode-unlimited off"
 } else {
-    Ok "plugin not installed (it does not change the quota)"
+    Ok "plugin not installed (run 'opencode-unlimited on' or 'plugin install' when you want it)"
 }
 
 if (-not $NoPath) {

@@ -1,175 +1,98 @@
 import { createHash } from "node:crypto"
-import { readFileSync, statSync } from "node:fs"
+import { readFileSync, statSync, writeFileSync, mkdirSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
-const IDENTITY_PATHS = [
-  process.env.OPENCODE_UNLIMITED_IDENTITY || "",
-  join(homedir(), ".config", "opencode", "identity.json"),
-  process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "opencode", "identity.json") : "",
-  join(homedir(), ".opencode", "identity.json"),
-].filter(Boolean)
+const CONFIG_DIR = process.env.XDG_CONFIG_HOME
+  ? join(process.env.XDG_CONFIG_HOME, "opencode")
+  : join(homedir(), ".config", "opencode")
 
-const STATE_PATHS = [
-  process.env.OPENCODE_UNLIMITED_STATE || "",
-  join(homedir(), ".config", "opencode", "unlimited.json"),
-  process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "opencode", "unlimited.json") : "",
-].filter(Boolean)
+const IDENTITY_FILE = process.env.OPENCODE_UNLIMITED_IDENTITY || join(CONFIG_DIR, "identity.json")
+const STATE_FILE = process.env.OPENCODE_UNLIMITED_STATE || join(CONFIG_DIR, "unlimited.json")
+const MARKER_FILE = join(CONFIG_DIR, "unlimited-shield.state.json")
 
 const PROJECT_ID_RE = /^[0-9a-f]{40}$/
 const CACHE_MS = 1000
-
-const SESSION_HEADERS = [
-  "x-opencode-session-id",
-  "x-opencode-session",
-  "x-session-affinity",
-  "X-Session-Id",
-]
+const AFFINITY_HEADERS = ["x-opencode-session-id", "x-opencode-session", "x-session-affinity", "x-session-id"]
 
 let identityId = null
-let identityPath = null
-let identityMtime = 0
-let identityStat = 0
-let identityWarned = false
-
-let stateSalt = ""
-let stateEnabled = true
-let stateOverrides = {}
-let statePath = null
-let stateMtime = 0
-let stateStat = 0
-
+let identityAt = 0
+let stateAt = 0
+let salt = ""
+let affinityOn = true
+let overrides = {}
 const affinityCache = new Map()
 
-function emit(ctx, level, message, extra) {
+function readJson(file) {
   try {
-    if (ctx?.app?.log) {
-      ctx.app.log({ body: { service: "unlimited-shield", level, message, extra } })
-    }
+    const stat = statSync(file)
+    if (!stat.isFile()) return null
+    return JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""))
   } catch {
-    return
+    return null
   }
 }
 
-function readIdentity() {
-  for (const file of IDENTITY_PATHS) {
-    let stat
-    try {
-      stat = statSync(file)
-    } catch {
-      continue
-    }
-    if (!stat.isFile()) continue
-    if (file === identityPath && stat.mtimeMs === identityMtime && identityId) return identityId
-
-    let parsed
-    try {
-      parsed = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""))
-    } catch {
-      continue
-    }
-    const raw = typeof parsed?.projectId === "string" ? parsed.projectId.trim().toLowerCase() : ""
-    if (!PROJECT_ID_RE.test(raw)) continue
-
-    identityId = raw
-    identityPath = file
-    identityMtime = stat.mtimeMs
-    return raw
-  }
-  return null
-}
-
-function readState() {
-  for (const file of STATE_PATHS) {
-    let stat
-    try {
-      stat = statSync(file)
-    } catch {
-      continue
-    }
-    if (!stat.isFile()) continue
-    if (file === statePath && stat.mtimeMs === stateMtime) return
-
-    let parsed
-    try {
-      parsed = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""))
-    } catch {
-      continue
-    }
-    const affinity = parsed?.affinity
-    stateEnabled = affinity?.enabled !== false
-    stateSalt = typeof affinity?.salt === "string" ? affinity.salt : ""
-    const map = affinity?.overrides
-    stateOverrides = map && typeof map === "object" ? map : {}
-    statePath = file
-    stateMtime = stat.mtimeMs
-    affinityCache.clear()
-    return
-  }
-}
-
-function currentProjectId() {
+function projectId() {
   const now = Date.now()
-  if (identityId && now - identityStat < CACHE_MS) return identityId
-  identityStat = now
-  return readIdentity() ?? identityId
+  if (now - identityAt < CACHE_MS) return identityId
+  identityAt = now
+  const parsed = readJson(IDENTITY_FILE)
+  const raw = typeof parsed?.projectId === "string" ? parsed.projectId.trim().toLowerCase() : ""
+  identityId = PROJECT_ID_RE.test(raw) ? raw : null
+  return identityId
 }
 
-function currentState() {
+function loadState() {
   const now = Date.now()
-  if (now - stateStat >= CACHE_MS) {
-    stateStat = now
-    readState()
-  }
+  if (now - stateAt < CACHE_MS) return
+  stateAt = now
+  const parsed = readJson(STATE_FILE)
+  const affinity = parsed?.affinity
+  affinityOn = affinity?.enabled !== false
+  salt = typeof affinity?.salt === "string" ? affinity.salt : ""
+  overrides = affinity?.overrides && typeof affinity.overrides === "object" ? affinity.overrides : {}
+  affinityCache.clear()
 }
 
-function syntheticAffinity(sessionID) {
-  const override = stateOverrides[sessionID]
-  const seed = typeof override === "string" && override.slice(0, 4) === "ses_" ? override : `${sessionID}\u0000${stateSalt}`
+function affinityFor(sessionID) {
+  const pinned = overrides[sessionID]
+  const seed = typeof pinned === "string" && pinned.startsWith("ses_") ? pinned : sessionID + "\u0000" + salt
   const cached = affinityCache.get(seed)
   if (cached) return cached
-  const digest = createHash("sha256").update(seed).digest("hex")
-  const value = "ses_" + digest
+  const value = "ses_" + createHash("sha256").update(seed).digest("hex")
   if (affinityCache.size > 4096) affinityCache.clear()
   affinityCache.set(seed, value)
   return value
 }
 
-function setHeader(headers, name, value) {
-  if (typeof headers?.set === "function") {
-    headers.set(name, value)
-    return
-  }
+function stampHeaders(headers, sessionID) {
   if (!headers || typeof headers !== "object") return
-  const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase())
-  if (existing) {
-    headers[existing] = value
-    return
-  }
-  headers[name] = value
+  const id = projectId()
+  if (id) headers["x-opencode-project"] = id
+  loadState()
+  if (!affinityOn || !salt || !sessionID) return
+  const value = affinityFor(sessionID)
+  for (const name of AFFINITY_HEADERS) headers[name] = value
 }
 
-function applyHeaders(headers, sessionID, ctx) {
-  try {
-    const projectId = currentProjectId()
-    if (!projectId) {
-      if (!identityWarned) {
-        identityWarned = true
-        emit(ctx, "warn", "identity.json missing or invalid; x-opencode-project untouched", {
-          looked: IDENTITY_PATHS,
-        })
-      }
-    } else {
-      identityWarned = false
-      setHeader(headers, "x-opencode-project", projectId)
-    }
+function stampNative(headers, sessionID) {
+  if (!headers || typeof headers.set !== "function") return
+  const id = projectId()
+  if (id) headers.set("x-opencode-project", id)
+  loadState()
+  if (!affinityOn || !salt || !sessionID) return
+  const value = affinityFor(sessionID)
+  for (const name of AFFINITY_HEADERS) headers.set(name, value)
+}
 
-    currentState()
-    if (!stateEnabled || !stateSalt || !sessionID) return
-    const affinity = syntheticAffinity(sessionID)
-    for (const name of SESSION_HEADERS) setHeader(headers, name, affinity)
-  } catch (error) {
-    emit(ctx, "error", "header injection failed", { error: String(error) })
+function writeMarker(payload) {
+  try {
+    const dir = dirname(MARKER_FILE)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(MARKER_FILE, JSON.stringify(payload, null, 2) + "\n", "utf8")
+  } catch {
+    return
   }
 }
 
@@ -177,36 +100,51 @@ export default {
   id: "unlimited-shield",
 
   async setup(ctx) {
-    const registered = []
+    const hooks = []
 
     try {
-      if (typeof ctx?.session?.hook === "function") {
-        await ctx.session.hook("model.request", (event) => {
-          applyHeaders(event?.headers, event?.sessionID, ctx)
-        })
-        registered.push("model.request")
-      }
-    } catch (error) {
-      emit(ctx, "warn", "model.request hook unavailable", { error: String(error) })
+      await ctx.session.hook("model.request", (event) => {
+        stampHeaders(event.headers, event.sessionID)
+      })
+      hooks.push("model.request")
+    } catch {
+      void 0
     }
 
     try {
-      if (typeof ctx?.session?.hook === "function") {
-        await ctx.session.hook("http.request", (event) => {
-          const headers = event?.request?.headers
-          applyHeaders(headers, event?.sessionID, ctx)
-        })
-        registered.push("http.request")
-      }
-    } catch (error) {
-      emit(ctx, "warn", "http.request hook unavailable", { error: String(error) })
+      await ctx.session.hook("http.request", (event) => {
+        stampNative(event.request?.headers, event.sessionID)
+      })
+      hooks.push("http.request")
+    } catch {
+      void 0
     }
 
-    readState()
-    emit(ctx, "info", "unlimited-shield loaded", {
-      projectId: currentProjectId(),
-      affinity: stateEnabled && stateSalt ? "on" : "off",
-      hooks: registered,
-    })
+    const marker = {
+      plugin: "unlimited-shield",
+      loaded: true,
+      version: ctx.app?.version || "",
+      directory: ctx.location?.directory || "",
+      projectId: projectId(),
+      affinity: affinityOn && salt ? "on" : "off",
+      hooks,
+      at: new Date().toISOString(),
+    }
+
+    writeMarker(marker)
+
+    try {
+      await ctx.storage.set("shield", marker)
+    } catch {
+      void 0
+    }
+
+    if (typeof console?.log === "function") {
+      console.log("unlimited-shield loaded hooks=" + hooks.join(","))
+    }
+
+    return () => {
+      writeMarker({ plugin: "unlimited-shield", loaded: false, at: new Date().toISOString() })
+    }
   },
 }

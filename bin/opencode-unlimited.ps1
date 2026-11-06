@@ -19,14 +19,34 @@ $script:DataDir = Join-Path $script:UserHome ".local\share\opencode"
 $script:StateFile = Join-Path $script:ConfigDir "unlimited.json"
 $script:InfoFile = Join-Path $script:ConfigDir "unlimited-info.json"
 $script:PluginDir = Join-Path $script:ConfigDir "plugins"
-$script:PluginFile = Join-Path $script:PluginDir "unlimited-shield.js"
+$script:PluginFolder = Join-Path $script:PluginDir "unlimited-shield"
+$script:PluginFile = Join-Path $script:PluginFolder "index.js"
+$script:PluginEntry = "./plugins/unlimited-shield"
+$script:PluginMarker = Join-Path $script:ConfigDir "unlimited-shield.state.json"
 $script:PidFile = Join-Path $script:ConfigDir "unlimited-bridge.pid"
+$script:WatchPidFile = Join-Path $script:ConfigDir "unlimited-watch.pid"
+$script:WatchLogFile = Join-Path $script:ConfigDir "unlimited-watch.log"
+$script:AutoTaskName = "OpenCodeUnlimitedWatch"
 $script:LogFile = Join-Path $script:ConfigDir "unlimited-bridge.log"
 $script:IpCacheFile = Join-Path $script:ConfigDir "unlimited-ip.json"
+$script:PoolCacheFile = Join-Path $script:ConfigDir "unlimited-pool.json"
+$script:RotateGateFile = Join-Path $script:ConfigDir "unlimited-rotate.json"
+$script:AuthDir = Join-Path $script:DataDir "auth.json"
+if ($env:LOCALAPPDATA) { $script:LocalRoot = Join-Path $env:LOCALAPPDATA "opencode-unlimited" }
+else { $script:LocalRoot = Join-Path $script:UserHome "AppData\Local\opencode-unlimited" }
+$script:AuthSnapshotDir = Join-Path $script:LocalRoot "auth-snapshot"
+$script:AuthSnapshot = Join-Path $script:AuthSnapshotDir "auth.json"
 $script:Gateway = "https://opencode.ai/inference/openai/v1/chat/completions"
 $script:TraceUrl = "https://cloudflare.com/cdn-cgi/trace"
 $script:DefaultModel = "deepseek-v4.1-flash-free"
 $script:DefaultBridgePort = 8899
+$script:SlowProxyMs = 3500
+$script:DefaultProxySources = @(
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt"
+)
 $script:ToolVersion = "1.0.2"
 $script:InfoCache = $null
 
@@ -75,10 +95,17 @@ function Get-Config {
         proxy        = ""
         proxyPool    = @()
         proxyIndex   = 0
+        proxyListUrl = ""
         bridgePort   = $script:DefaultBridgePort
         ipMode       = "manual"
         rotateDb     = $false
+        autoMode     = $false
+        autoStart    = $false
+        autoTries    = 12
+        autoMinutes  = 8
+        reidOnAuto   = $true
         lastIp       = ""
+        lastCountry  = ""
         lastBucket   = ""
         updatedAt    = ""
     }
@@ -168,42 +195,136 @@ function Invoke-WebRequestRaw([string]$Method, [string]$Url, [string]$Body, [str
     }
 }
 
-function Get-EgressIp([string]$ProxyUrl, [switch]$Force) {
+function Get-EgressTrace([string]$ProxyUrl, [switch]$Force, [int]$TimeoutSec = 8, [switch]$NoFallback) {
     $cache = Get-Json $script:IpCacheFile
-    if (-not $Force -and $cache -and $cache.ip -and $cache.ip -ne "unavailable") {
+    if (-not $Force -and $cache -and $cache.ip) {
         $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$cache.at
-        if ($age -ge 0 -and $age -lt 60 -and [string]$cache.via -eq $ProxyUrl) { return $cache.ip }
+        if ($age -ge 0 -and $age -lt 60 -and [string]$cache.via -eq [string]$ProxyUrl) {
+            return [pscustomobject]@{
+                Ip      = [string]$cache.ip
+                Country = [string]$cache.country
+                Warp    = [string]$cache.warp
+                Colo    = [string]$cache.colo
+                At      = [long]$cache.at
+                Cached  = $true
+                Ms      = 0
+            }
+        }
     }
-    $ip = "unavailable"
+    $text = ""
+    $elapsed = 0
     $curl = Get-Curl
     if ($curl) {
-        $curlArgs = @("-s", "--max-time", "8")
+        $connect = [Math]::Max(2, [Math]::Min(5, $TimeoutSec - 1))
+        $curlArgs = @("-s", "--connect-timeout", [string]$connect, "--max-time", [string]$TimeoutSec)
         if ($ProxyUrl) { $curlArgs += @("--proxy", $ProxyUrl) }
         $curlArgs += $script:TraceUrl
-        $out = Invoke-Curl $curlArgs
-        if ($out) {
-            foreach ($line in ($out -split "`n")) {
-                if ($line -match "^ip=(.+)$") { $ip = $Matches[1].Trim() }
-            }
-        }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $text = Invoke-Curl $curlArgs
+        $watch.Stop()
+        $elapsed = [int]$watch.ElapsedMilliseconds
     }
-    if ($ip -eq "unavailable") {
+    if ((-not $text -or $text -notmatch "ip=") -and -not $NoFallback) {
         $result = Invoke-WebRequestRaw "GET" $script:TraceUrl $null $ProxyUrl
-        if ($result.Status -eq 200) {
-            foreach ($line in ($result.Body -split "`n")) {
-                if ($line -match "^ip=(.+)$") { $ip = $Matches[1].Trim() }
-            }
+        if ($result.Status -eq 200) { $text = $result.Body }
+    }
+    $ip = ""
+    $country = ""
+    $warp = ""
+    $colo = ""
+    if ($text) {
+        foreach ($line in ($text -split "`n")) {
+            $clean = $line.Trim()
+            if ($clean -match "^ip=(.+)$") { $ip = $Matches[1].Trim() }
+            elseif ($clean -match "^loc=(.+)$") { $country = $Matches[1].Trim() }
+            elseif ($clean -match "^warp=(.+)$") { $warp = $Matches[1].Trim() }
+            elseif ($clean -match "^colo=(.+)$") { $colo = $Matches[1].Trim() }
         }
     }
-    if ($ip -ne "unavailable") {
+    $at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($ip) {
         $entry = [ordered]@{
-            ip  = $ip
-            at  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-            via = $ProxyUrl
+            ip      = $ip
+            country = $country
+            warp    = $warp
+            colo    = $colo
+            at      = $at
+            via     = [string]$ProxyUrl
         }
         Write-TextFile $script:IpCacheFile ($entry | ConvertTo-Json -Depth 3)
     }
-    return $ip
+    return [pscustomobject]@{
+        Ip      = $ip
+        Country = $country
+        Warp    = $warp
+        Colo    = $colo
+        At      = $at
+        Cached  = $false
+        Ms      = $elapsed
+    }
+}
+
+function Invoke-ProxyHealth([string]$Action, [string[]]$Extra) {
+    $helper = Join-Path $script:Root "lib\proxy-health.js"
+    if (-not (Test-Path $helper)) { return $null }
+    $nodeArgs = @($Action)
+    if ($Extra) { $nodeArgs += $Extra }
+    $raw = Invoke-NodeHelper $helper $nodeArgs
+    if (-not $raw) { return $null }
+    try { return ($raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Set-ProxyHealth([string]$Url, [bool]$Ok, [int]$Ms, [string]$Reason) {
+    if (-not $Url) { return }
+    $extra = @($Url, $(if ($Ok) { "ok" } else { "fail" }), [string]$Ms)
+    if ($Reason) { $extra += $Reason }
+    Invoke-ProxyHealth "record" $extra | Out-Null
+}
+
+function Get-RankedProxyPool($cfg) {
+    $pool = @(Get-ProxyPool $cfg)
+    if (-not $pool.Count) { return @() }
+    $ranked = Invoke-ProxyHealth "rank" $pool
+    if ($ranked -and $ranked.proxies) { return @($ranked.proxies) }
+    return $pool
+}
+
+function Get-ProxyHealthReport($cfg) {
+    $pool = @(Get-ProxyPool $cfg)
+    if (-not $pool.Count) { return $null }
+    return Invoke-ProxyHealth "rank" $pool
+}
+
+function Get-EgressIp([string]$ProxyUrl, [switch]$Force) {
+    $trace = Get-EgressTrace $ProxyUrl -Force:$Force
+    if ($trace.Ip) { return $trace.Ip }
+    return ""
+}
+
+function Test-RouteOk($trace, [string]$Mode) {
+    if (-not $trace -or -not $trace.Ip) { return $false }
+    if ($Mode -eq "warp") { return ($trace.Warp -eq "on" -or $trace.Warp -eq "plus") }
+    return $true
+}
+
+function Test-RouteFilter($trace, [string]$Country, [string]$Prefix) {
+    if (-not $trace -or -not $trace.Ip) { return $false }
+    if ($Country -and ([string]$trace.Country).ToUpperInvariant() -ne $Country.ToUpperInvariant()) { return $false }
+    if ($Prefix -and -not ([string]$trace.Ip).StartsWith($Prefix)) { return $false }
+    return $true
+}
+
+function Test-SameBlock([string]$Left, [string]$Right) {
+    if (-not $Left -or -not $Right) { return $false }
+    $helper = Join-Path $script:Root "lib\egress.js"
+    if (Test-Path $helper) {
+        $raw = Invoke-NodeHelper $helper @("same", $Left, $Right)
+        try {
+            $data = $raw | ConvertFrom-Json
+            if ($null -ne $data -and $null -ne $data.same) { return [bool]$data.same }
+        } catch { }
+    }
+    return ($Left -eq $Right)
 }
 
 function Get-OpenCodeInfo([switch]$Refresh) {
@@ -328,6 +449,19 @@ function Get-DatabasePath {
     return ""
 }
 
+function Invoke-Native([string]$File, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = (& $File @Arguments 2>&1 | Out-String)
+        return [pscustomobject]@{ Code = $LASTEXITCODE; Text = $out }
+    } catch {
+        return [pscustomobject]@{ Code = -1; Text = $_.Exception.Message }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Invoke-NodeHelper([string]$Helper, [string[]]$HelperArgs) {
     $node = Get-Command node -ErrorAction SilentlyContinue
     if (-not $node) { return "" }
@@ -399,11 +533,16 @@ function Install-SlashCommand {
         "opencode-unlimited:identity" = @{ Args = "identity"; Desc = "show, rotate or restore the virtual device identity" }
         "opencode-unlimited:block"    = @{ Args = "block"; Desc = "egress blocks seen today and which are spent" }
         "opencode-unlimited:usage"    = @{ Args = "usage"; Desc = "daily free bucket state and the reset clock" }
+        "opencode-unlimited:watch"    = @{ Args = "watch"; Desc = "read the opencode log for a limit line, zero messages spent" }
+        "opencode-unlimited:hunt"     = @{ Args = "hunt"; Desc = "rotate until the probe says the route is open" }
         "opencode-unlimited:clear"    = @{ Args = "clear"; Desc = "strip stored free-limit errors from sessions" }
+        "opencode-unlimited:token"    = @{ Args = "token"; Desc = "show or save the local auth.json snapshot" }
+        "opencode-unlimited:on"       = @{ Args = "on"; Desc = "full auto: identity, pool, route, watcher, autostart" }
+        "opencode-unlimited:off"      = @{ Args = "off"; Desc = "stop the watcher, drop the proxy, keep the files" }
         "opencode-unlimited:reid"     = @{ Args = "reid"; Desc = "mint fresh session ids, keep every message" }
         "opencode-unlimited:model"    = @{ Args = "model"; Desc = "list providers and switch this folder to a free model" }
     }
-    $argNames = @("opencode-unlimited:reset", "opencode-unlimited:clear", "opencode-unlimited:reid", "opencode-unlimited:model")
+    $argNames = @("opencode-unlimited:reset", "opencode-unlimited:clear", "opencode-unlimited:reid", "opencode-unlimited:model", "opencode-unlimited:watch", "opencode-unlimited:hunt")
 
     $cfgPath = Join-Path $script:ConfigDir "opencode.jsonc"
     if (-not (Test-Path $cfgPath)) { $cfgPath = Join-Path $script:ConfigDir "opencode.json" }
@@ -437,27 +576,128 @@ function Install-SlashCommand {
     Write-Ok ("slash commands: " + (($defs.Keys) -join ", "))
 }
 
+function Get-GlobalConfigPath {
+    $jsonc = Join-Path $script:ConfigDir "opencode.jsonc"
+    if (Test-Path $jsonc) { return $jsonc }
+    return (Join-Path $script:ConfigDir "opencode.json")
+}
+
+function Read-GlobalConfig {
+    $path = Get-GlobalConfigPath
+    if (-not (Test-Path $path)) { return [pscustomobject]@{} }
+    try {
+        $raw = [System.IO.File]::ReadAllText($path) -replace "^\uFEFF", ""
+        $cfg = $raw | ConvertFrom-Json
+        if ($cfg) { return $cfg }
+    } catch {
+        return $null
+    }
+    return [pscustomobject]@{}
+}
+
+function Save-GlobalConfig($cfg) {
+    $path = Get-GlobalConfigPath
+    $json = $cfg | ConvertTo-Json -Depth 30
+    $prop = $cfg.PSObject.Properties["plugins"]
+    if ($null -ne $prop -and $prop.Value -is [string] -and $prop.Value) {
+        $escaped = $prop.Value -replace '\\', '\\\\' -replace '"', '\"'
+        $json = $json -replace '("plugins"\s*:\s*)"' + [regex]::Escape($prop.Value) + '"', ('$1["' + $escaped + '"]')
+    }
+    [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-RegisteredPlugins($cfg) {
+    if (-not $cfg) { return @() }
+    $prop = $cfg.PSObject.Properties["plugins"]
+    if ($null -eq $prop -or $null -eq $prop.Value) { return @() }
+    return @($prop.Value | ForEach-Object {
+        if ($_ -is [string]) { $_ } elseif ($_ -and $_.package) { [string]$_.package } else { "" }
+    } | Where-Object { $_ })
+}
+
+function Test-PluginRegistered {
+    $cfg = Read-GlobalConfig
+    $list = Get-RegisteredPlugins $cfg
+    foreach ($item in $list) {
+        if ($item -eq $script:PluginEntry) { return $true }
+    }
+    return $false
+}
+
+function Register-PluginEntry([bool]$Enabled) {
+    $cfg = Read-GlobalConfig
+    if (-not $cfg) { return $false }
+    $list = @(Get-RegisteredPlugins $cfg | Where-Object { $_ -ne $script:PluginEntry })
+    if ($Enabled) { $list += $script:PluginEntry }
+    $value = @()
+    if ($list.Count -gt 0) { $value = [string[]]$list }
+    $cfg | Add-Member -NotePropertyName plugins -NotePropertyValue $value -Force
+    try {
+        Save-GlobalConfig $cfg
+    } catch {
+        Write-Warn2 ("global config not written: " + $_.Exception.Message)
+        return $false
+    }
+    return $true
+}
+
 function Install-Plugin {
-    if (-not (Test-Path $script:BundledPlugin)) { Write-Bad "bundled plugin missing: $script:BundledPlugin"; return }
-    if (-not (Test-Path $script:PluginDir)) { New-Item -ItemType Directory -Path $script:PluginDir -Force | Out-Null }
+    if (-not (Test-Path $script:BundledPlugin)) { Write-Bad "bundled plugin missing: $script:BundledPlugin"; return $false }
+    if (-not (Test-Path $script:PluginFolder)) { New-Item -ItemType Directory -Path $script:PluginFolder -Force | Out-Null }
     Copy-Item $script:BundledPlugin $script:PluginFile -Force
-    Write-Ok "plugin deployed: $script:PluginFile"
+    if (-not (Register-PluginEntry $true)) { return $false }
+    Write-Ok ("plugin installed and listed in opencode config: " + $script:PluginEntry)
+    return $true
 }
 
 function Get-PluginState {
-    if (Test-Path $script:PluginFile) { return "enabled" }
-    if (Test-Path ($script:PluginFile + ".disabled")) { return "disabled" }
+    $present = Test-Path $script:PluginFile
+    $listed = Test-PluginRegistered
+    if ($present -and $listed) {
+        $marker = Get-Json $script:PluginMarker
+        if ($marker -and $marker.loaded -eq $true) { return "loaded" }
+        return "enabled (waiting for a server load)"
+    }
+    if ($present -or $listed) { return "partial" }
     return "missing"
 }
 
 function Set-PluginEnabled([bool]$Enabled) {
-    $disabled = $script:PluginFile + ".disabled"
+    $disabled = $script:PluginFile + ".off"
     if ($Enabled) {
-        if (Test-Path $disabled) { Move-Item $disabled $script:PluginFile -Force }
+        if (-not (Test-Path $script:PluginFile)) {
+            if (Test-Path $disabled) {
+                if (-not (Test-Path $script:PluginFolder)) { New-Item -ItemType Directory -Path $script:PluginFolder -Force | Out-Null }
+                Move-Item $disabled $script:PluginFile -Force
+            } elseif (Test-Path $script:BundledPlugin) {
+                if (-not (Test-Path $script:PluginFolder)) { New-Item -ItemType Directory -Path $script:PluginFolder -Force | Out-Null }
+                Copy-Item $script:BundledPlugin $script:PluginFile -Force
+            }
+        }
+        Register-PluginEntry $true | Out-Null
         return
     }
+    Register-PluginEntry $false | Out-Null
     if (Test-Path $script:PluginFile) { Move-Item $script:PluginFile $disabled -Force }
 }
+
+function Test-PluginLive {
+    $marker = Get-Json $script:PluginMarker
+    if ($marker -and $marker.loaded -eq $true) { return $marker }
+    $info = Get-OpenCodeInfo
+    if (-not $info.exe -or -not $info.running) { return $null }
+    $result = Invoke-Native $info.exe @("api", "get", "/api/plugin")
+    if ($result.Code -ne 0 -or -not $result.Text) { return $null }
+    if ($result.Text -notmatch '"id"\s*:\s*"unlimited-shield"') { return $null }
+    return [pscustomobject]@{
+        plugin  = "unlimited-shield"
+        loaded  = $true
+        version = [string]$info.version
+        hooks   = @("model.request", "http.request")
+        at      = "live"
+    }
+}
+
 
 function Set-ServiceEnv([string]$Name, [string]$Value) {
     $oc = Resolve-OpenCode
@@ -515,12 +755,70 @@ function Stop-Bridge {
     Remove-Item $script:PidFile -Force -ErrorAction SilentlyContinue
 }
 
-function Test-Upstream([string]$ProxyUrl) {
+function Test-Upstream([string]$ProxyUrl, [int]$TimeoutSec = 10) {
     $curl = Get-Curl
     if (-not $curl) { return $true }
-    $out = Invoke-Curl @("-s", "--max-time", "10", "--proxy", $ProxyUrl, $script:TraceUrl)
+    $connect = [Math]::Max(2, [Math]::Min(5, $TimeoutSec - 1))
+    $out = Invoke-Curl @("-s", "--connect-timeout", [string]$connect, "--max-time", [string]$TimeoutSec, "--proxy", $ProxyUrl, $script:TraceUrl)
     if ($out -and $out -match "ip=") { return $true }
     return $false
+}
+
+function ConvertFrom-ProxyText([string]$Raw) {
+    $found = @()
+    if (-not $Raw) { return $found }
+    foreach ($match in [regex]::Matches($Raw, "(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})")) {
+        $octets = @()
+        if ($match.Groups[1].Value -match "^(\d+)\.(\d+)\.(\d+)\.(\d+)$") {
+            $octets = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4])
+        }
+        if ($octets.Count -ne 4) { continue }
+        if (($octets | Where-Object { $_ -gt 255 }).Count -gt 0) { continue }
+        $port = [int]$match.Groups[2].Value
+        if ($port -lt 1 -or $port -gt 65535) { continue }
+        $entry = "http://" + $match.Groups[1].Value + ":" + $port
+        if ($found -notcontains $entry) { $found += $entry }
+    }
+    return $found
+}
+
+function Get-ProxySources($cfg) {
+    $list = @()
+    $custom = [string]$cfg.proxyListUrl
+    if ($custom -match "^https?://") { $list += $custom }
+    foreach ($url in $script:DefaultProxySources) {
+        if ($list -notcontains $url) { $list += $url }
+    }
+    return $list
+}
+
+function Update-ProxyList($cfg, [switch]$Force, [switch]$Quiet) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $cache = Get-Json $script:PoolCacheFile
+    if (-not $Force -and $cache -and $cache.at -and ($now - [long]$cache.at) -lt 21600) {
+        $cached = @($cache.proxies)
+        if ($cached.Count -gt 0) { return $cached.Count }
+    }
+    foreach ($url in @(Get-ProxySources $cfg)) {
+        if (-not $Quiet) { Write-Info ("proxy list: asking " + $url) }
+        $raw = Invoke-Curl @("-s", "-L", "--max-time", "20", $url)
+        if (-not $raw -or $raw.Length -lt 32) { continue }
+        $found = @(ConvertFrom-ProxyText $raw)
+        if (-not $found.Count) { continue }
+        $shuffled = @($found | Sort-Object { Get-Random })
+        $take = [Math]::Min($shuffled.Count, 200)
+        $picked = @($shuffled[0..($take - 1)])
+        $payload = [ordered]@{ at = $now; source = $url; proxies = $picked }
+        Write-TextFile $script:PoolCacheFile ($payload | ConvertTo-Json -Depth 4)
+        if ([string]$cfg.proxyListUrl -ne $url) {
+            $cfg.proxyListUrl = $url
+            Save-Config $cfg
+        }
+        if (-not $Quiet) { Write-Info ("proxy list: " + $picked.Count + " candidates") }
+        return $picked.Count
+    }
+    if (-not $Quiet) { Write-Warn2 "every proxy source came back empty" }
+    return 0
 }
 
 function Get-ProxyPool($cfg) {
@@ -531,52 +829,117 @@ function Get-ProxyPool($cfg) {
             if ($url -and $url -match "^(socks5h?|http|https)://") { $pool += $url }
         }
     }
+    $cache = Get-Json $script:PoolCacheFile
+    if ($cache -and $cache.proxies) {
+        foreach ($entry in @($cache.proxies)) {
+            $url = [string]$entry
+            if ($url -and $url -match "^https?://" -and $pool -notcontains $url) { $pool += $url }
+        }
+    }
     return $pool
 }
 
-function Invoke-EgressRotation($cfg, [string]$AvoidIp, [switch]$Dry) {
-    $pool = @(Get-ProxyPool $cfg)
-    if (-not $pool.Count) {
-        if ($cfg.proxy) {
-            if ($Dry) { Write-Info ("would apply: " + $cfg.proxy); return }
-            if (Apply-Proxy $cfg) { Restart-Service }
-            return
-        }
-        Write-Info "manual mode, no proxy configured"
-        Write-Info "change the network yourself, or load a pool: opencode-unlimited proxy pool add socks5://host:port"
-        return
+function Step-Egress($cfg, [string]$Url, [string]$AvoidIp, [string]$Country, [string]$Prefix) {
+    if (-not $Url) { return $null }
+    Write-Info ("testing: " + $Url)
+    $trace = Get-EgressTrace $Url -Force -TimeoutSec 6 -NoFallback
+    $ms = [int]$trace.Ms
+    if (-not $trace.Ip) {
+        Set-ProxyHealth $Url $false $ms "timeout"
+        Write-Info "  no answer in 6s"
+        return $null
     }
-    if ($Dry) {
-        $next = $pool[(([int]$cfg.proxyIndex + 1) % $pool.Count)]
-        Write-Info ("would rotate to: " + $next + " (" + $pool.Count + " in the pool)")
-        return
+    if ($ms -gt $script:SlowProxyMs) {
+        Set-ProxyHealth $Url $true $ms "slow"
+        Write-Info ("  too slow, " + $ms + " ms")
+        return $null
     }
-    $tries = [Math]::Min($pool.Count, 8)
-    for ($attempt = 0; $attempt -lt $tries; $attempt++) {
-        $cfg.proxyIndex = (([int]$cfg.proxyIndex + 1) % $pool.Count)
-        $url = $pool[$cfg.proxyIndex]
-        Write-Info ("trying proxy " + ($cfg.proxyIndex + 1) + "/" + $pool.Count + ": " + $url)
-        $cfg.proxy = $url
-        $cfg.ipMode = "proxy"
-        Save-Config $cfg
-        if (-not (Apply-Proxy $cfg)) { continue }
-        Restart-Service
-        Start-Sleep -Seconds 1
-        $ip = Get-EgressIp $url -Force
-        if (-not $ip) { Write-Warn2 "egress ip unknown through this proxy, next"; continue }
-        if ($AvoidIp -and $ip -eq $AvoidIp) { Write-Warn2 ("same egress ip: " + $ip + ", next"); continue }
-        Write-Ok ("egress via " + $url + " -> " + $ip)
-        return
+    Set-ProxyHealth $Url $true $ms ""
+    if ($AvoidIp -and (Test-SameBlock $trace.Ip $AvoidIp)) {
+        Write-Info ("  same egress block, " + $trace.Ip)
+        return $null
     }
-    Write-Warn2 "no proxy in the pool produced a new egress ip"
+    if (-not (Test-RouteFilter $trace $Country $Prefix)) {
+        Write-Info ("  filtered out, " + $trace.Ip + " " + $trace.Country)
+        return $null
+    }
+    $cfg.proxy = $Url
+    $cfg.ipMode = "proxy"
+    Save-Config $cfg
+    if (-not (Apply-Proxy $cfg -SkipTest)) {
+        Set-ProxyHealth $Url $false 0 "upstream"
+        return $null
+    }
+    Write-Info ("  live, " + $ms + " ms")
+    return $trace
 }
 
-function Apply-Proxy($cfg) {
+function Invoke-EgressRotation($cfg, [string]$AvoidIp, [string]$Country, [string]$Prefix, [switch]$Dry, [switch]$NoRestart, [int]$Tries = 8) {
+    if (@(Get-ProxyPool $cfg).Count -eq 0) { Update-ProxyList $cfg | Out-Null }
+    $pool = @(Get-RankedProxyPool $cfg)
+    if (-not $pool.Count) {
+        if ($cfg.ipMode -eq "warp") {
+            if ($Dry) { Write-Info "would reconnect warp"; return $null }
+            $trace = Invoke-WarpRotate $cfg
+            if (-not (Test-RouteOk $trace "warp")) { Write-Warn2 "warp is not carrying the route"; return $null }
+            if ($AvoidIp -and (Test-SameBlock $trace.Ip $AvoidIp)) { Write-Warn2 ("same egress block: " + $trace.Ip); return $null }
+            if (-not (Test-RouteFilter $trace $Country $Prefix)) { Write-Warn2 ("filtered out: " + $trace.Ip + " " + $trace.Country); return $null }
+            Write-Ok ("warp reconnected -> " + $trace.Ip + " " + $trace.Country)
+            return $trace
+        }
+        if ($cfg.proxy) {
+            if ($Dry) { Write-Info ("would apply: " + $cfg.proxy); return $null }
+            if (-not (Apply-Proxy $cfg)) { return $null }
+            Restart-Service
+            Start-Sleep -Milliseconds 600
+            $trace = Get-EgressTrace $cfg.proxy -Force
+            if (-not (Test-RouteOk $trace $cfg.ipMode)) { Write-Warn2 "route check failed"; return $null }
+            if ($AvoidIp -and (Test-SameBlock $trace.Ip $AvoidIp)) { Write-Warn2 ("same egress block: " + $trace.Ip); return $null }
+            if (-not (Test-RouteFilter $trace $Country $Prefix)) { Write-Warn2 ("filtered out: " + $trace.Ip + " " + $trace.Country); return $null }
+            return $trace
+        }
+        Write-Info "manual mode, no proxy configured"
+        Write-Info "change the network yourself, or run: opencode-unlimited on"
+        return $null
+    }
+    if ($Dry) {
+        $next = $pool[(([int]$cfg.proxyIndex) % $pool.Count)]
+        Write-Info ("would rotate to: " + $next + " (" + $pool.Count + " in the pool)")
+        return $null
+    }
+    $limit = [Math]::Min($pool.Count, [Math]::Max(1, $Tries))
+    $start = [int]$cfg.proxyIndex
+    for ($i = 0; $i -lt $limit; $i++) {
+        $index = ($start + $i) % $pool.Count
+        $trace = Step-Egress $cfg $pool[$index] $AvoidIp $Country $Prefix
+        if ($trace) {
+            $cfg.proxyIndex = ($index + 1) % $pool.Count
+            Save-Config $cfg
+            if (-not $NoRestart) {
+                Restart-Service
+                Start-Sleep -Milliseconds 600
+            }
+            Write-Ok ("egress via " + $cfg.proxy + " -> " + $trace.Ip + " " + $trace.Country + "  [" + $trace.Ms + " ms]")
+            return $trace
+        }
+    }
+    Write-Warn2 "no proxy in the pool produced a usable egress block"
+    return $null
+}
+
+function Set-ProxyEnv([string]$Url) {
+    $noProxy = "localhost,127.0.0.1,::1"
+    foreach ($name in @("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")) {
+        Set-ServiceEnv $name $Url
+    }
+    foreach ($name in @("NO_PROXY", "no_proxy")) {
+        Set-ServiceEnv $name $noProxy
+    }
+}
+
+function Apply-Proxy($cfg, [switch]$SkipTest) {
     if (-not $cfg.proxy) {
-        Set-ServiceEnv "HTTPS_PROXY" ""
-        Set-ServiceEnv "HTTP_PROXY" ""
-        Set-ServiceEnv "ALL_PROXY" ""
-        Set-ServiceEnv "NO_PROXY" "localhost,127.0.0.1"
+        Set-ProxyEnv ""
         Write-Ok "service proxy cleared, direct egress"
         return $true
     }
@@ -587,17 +950,13 @@ function Apply-Proxy($cfg) {
         $url = "http://127.0.0.1:" + $cfg.bridgePort
         $viaBridge = $true
     }
-    if (-not (Test-Upstream $url)) {
+    if (-not $SkipTest -and -not (Test-Upstream $url 8)) {
         Write-Bad ("upstream not answering: " + $cfg.proxy)
         Write-Info "opencode was not switched, fix the proxy and retry"
         if ($viaBridge) { Stop-Bridge }
         return $false
     }
-    Write-Ok "upstream reachable"
-    Set-ServiceEnv "HTTPS_PROXY" $url
-    Set-ServiceEnv "HTTP_PROXY" $url
-    Set-ServiceEnv "ALL_PROXY" $url
-    Set-ServiceEnv "NO_PROXY" "localhost,127.0.0.1"
+    Set-ProxyEnv $url
     Write-Ok ("service proxy set: " + $url)
     return $true
 }
@@ -646,10 +1005,10 @@ function Cmd-Install {
     }
 
     if (Test-Path $script:PluginFile) {
-        Write-Warn2 "an old header plugin is still present"
-        Write-Info "remove it with: opencode-unlimited off"
+        Write-Warn2 "the shield plugin is installed"
+        Write-Info "check it with: opencode-unlimited plugin"
     } else {
-        Write-Ok "header plugin not installed (it does not change the quota)"
+        Write-Ok "shield plugin not installed (run 'opencode-unlimited on' when you want it)"
     }
     Write-Step ""
     Write-Ok "done. try: opencode-unlimited usage"
@@ -726,6 +1085,7 @@ function Cmd-Clear {
         Remove-StuckErrors
     }
     Write-Info "the banner comes from stored error rows, not from the server"
+    Write-Info "opencode re-reads session state as it goes, no restart needed"
     Write-Info "if a new prompt still fails, your egress ip is still on the spent bucket"
 }
 
@@ -735,8 +1095,12 @@ function Cmd-Reset {
     Write-Step $(if ($dry) { "==> reset (dry run, nothing is written)" } else { "==> reset" })
     $cfg = Get-Config
     $target = Get-PathArg
-    $ipBefore = Get-EgressIp $cfg.proxy -Force
-    Write-Info ("egress ip before: " + $(if ($ipBefore) { $ipBefore } else { "unknown" }))
+    $hunt = $Rest -contains "-Hunt" -or $Rest -contains "--hunt"
+    $traceBefore = Get-EgressTrace $cfg.proxy -Force
+    $ipBefore = $traceBefore.Ip
+    $beforeText = if ($ipBefore) { $ipBefore } else { "unknown" }
+    if ($traceBefore.Country) { $beforeText = $beforeText + "  " + $traceBefore.Country }
+    Write-Info ("egress ip before: " + $beforeText)
 
     Write-Step ""
     Write-Step "[1/6] device identity"
@@ -778,32 +1142,41 @@ function Cmd-Reset {
 
     Write-Step ""
     Write-Step "[4/6] egress route"
-    Invoke-EgressRotation $cfg $ipBefore -Dry:$dry
+    if ($hunt) {
+        if ($dry) { Write-Info "would hunt for a route that is not already spent" }
+        else { Invoke-Hunt $cfg 4 8 "" "" | Out-Null }
+    } else {
+        Invoke-EgressRotation $cfg $ipBefore "" "" -Dry:$dry | Out-Null
+    }
 
     Write-Step ""
     Write-Step "[5/6] egress block"
     Start-Sleep -Seconds 1
-    $ipAfter = Get-EgressIp $cfg.proxy -Force
+    $traceAfter = Get-EgressTrace $cfg.proxy -Force
+    $ipAfter = $traceAfter.Ip
     if ($dry) {
         Write-Info ("ip now: " + $(if ($ipAfter) { $ipAfter } else { "unknown" }) + ", nothing recorded")
     } else {
         $cfg.lastIp = $ipAfter
+        $cfg.lastCountry = $traceAfter.Country
         Save-Config $cfg
         $egressHelper = Join-Path $script:Root "lib\egress.js"
         if ((Test-Path $egressHelper) -and $ipAfter) {
             $env:UNLIMITED_EGRESS_IP = $ipAfter
+            if ($traceAfter.Country) { $env:UNLIMITED_EGRESS_COUNTRY = $traceAfter.Country }
             Invoke-NodeHelper $egressHelper @("record", "0", "0") | Out-Null
             Remove-Item Env:\UNLIMITED_EGRESS_IP -ErrorAction SilentlyContinue
+            Remove-Item Env:\UNLIMITED_EGRESS_COUNTRY -ErrorAction SilentlyContinue
         }
         if (-not $ipAfter) {
             Write-Warn2 "egress ip unknown"
-        } elseif ($ipAfter -eq $ipBefore) {
-            Write-Warn2 ("ip unchanged: " + $ipAfter)
+        } elseif ($ipBefore -and (Test-SameBlock $ipAfter $ipBefore)) {
+            Write-Warn2 ("same egress block: " + $ipAfter + " " + $traceAfter.Country)
             Write-Info "the meter follows the egress block, not the project, the session or the device"
             Write-Info "if a refusal was logged today, this block stays spent until 00:00 UTC"
             Write-Info "change the connection, or switch model to leave the meter behind"
         } else {
-            Write-Ok ("new egress ip: " + $ipAfter)
+            Write-Ok ("new egress block: " + $ipAfter + " " + $traceAfter.Country)
         }
     }
 
@@ -822,6 +1195,234 @@ function Cmd-Reset {
     else { Write-Ok "reset complete" }
     Write-Info ("quota resets at " + $midnight.ToLocalTime().ToString("h:mm tt") + " local, " + $midnight.ToString("HH:mm") + " UTC")
     Write-Info "switch model to skip the meter: opencode-unlimited model provider/model"
+}
+
+function Get-RestFlag([string[]]$Names, [string]$Default) {
+    for ($i = 0; $i -lt $Rest.Count - 1; $i++) {
+        if ($Names -contains $Rest[$i]) { return [string]$Rest[$i + 1] }
+    }
+    return $Default
+}
+
+function Get-RestInt([string[]]$Names, [int]$Default) {
+    $value = 0
+    if ([int]::TryParse((Get-RestFlag $Names ""), [ref]$value)) { return $value }
+    return $Default
+}
+
+function Invoke-Hunt($cfg, [int]$Tries, [int]$Minutes, [string]$Country, [string]$Prefix, [switch]$NoProbe, [switch]$NoRestart) {
+    if ($Tries -le 0) { $Tries = 6 }
+    if ($Minutes -le 0) { $Minutes = 10 }
+    $started = Get-Date
+    $avoid = Get-EgressIp $cfg.proxy -Force
+    $same = 0
+    $burned = 0
+    for ($attempt = 1; $attempt -le $Tries; $attempt++) {
+        if (((Get-Date) - $started).TotalMinutes -gt $Minutes) {
+            Write-Warn2 "hunt: time is up"
+            return $null
+        }
+        Write-Info ("[" + $attempt + "/" + $Tries + "] rotating")
+        $trace = Invoke-EgressRotation $cfg $avoid $Country $Prefix -NoRestart:$NoRestart -Tries $Tries
+        if (-not $trace) {
+            Write-Warn2 "  no route matched"
+            Start-Sleep -Seconds 2
+            continue
+        }
+        if ($avoid -and (Test-SameBlock $trace.Ip $avoid)) {
+            $same += 1
+            Write-Warn2 ("  same block as before (" + $same + "/3)")
+            if ($same -ge 3) {
+                Write-Bad "  the rotation keeps returning the same block"
+                return $null
+            }
+            Start-Sleep -Seconds 2
+            continue
+        }
+        $same = 0
+        $avoid = $trace.Ip
+        if ($NoProbe) { return $trace }
+        $app = Invoke-AppProbe ""
+        if ($app.Ok) {
+            Add-EgressRecord 200 0 $trace.Country | Out-Null
+            Write-Ok ("  route accepted: " + $trace.Ip + " " + $trace.Country)
+            return $trace
+        }
+        if ($app.Blocked) {
+            $burned += 1
+            Add-EgressRecord 429 0 $trace.Country | Out-Null
+            Write-Warn2 ("  block already spent (" + $burned + " burned)")
+            if ($burned -ge 4) {
+                Write-Bad "  too many burned blocks, stopping"
+                return $null
+            }
+            continue
+        }
+        Write-Warn2 ("  probe unconfirmed: " + $app.Reason)
+        return $trace
+    }
+    Write-Bad "hunt: no usable route found"
+    return $null
+}
+
+function Test-RotateGate {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $state = Get-Json $script:RotateGateFile
+    $keep = @()
+    if ($state -and $state.stamps) {
+        foreach ($stamp in @($state.stamps)) {
+            if (($now - [long]$stamp) -lt 1800) { $keep += [long]$stamp }
+        }
+    }
+    if ($keep.Count -ge 5) { return $false }
+    $keep += $now
+    Write-TextFile $script:RotateGateFile (([ordered]@{ stamps = @($keep) }) | ConvertTo-Json -Depth 3)
+    return $true
+}
+
+function Cmd-Hunt {
+    $cfg = Get-Config
+    $tries = Get-RestInt @("-Tries", "--tries", "-n") 6
+    $minutes = Get-RestInt @("-Minutes", "--minutes", "-m") 10
+    $country = (Get-RestFlag @("-Country", "--country") "").ToUpperInvariant()
+    $prefix = Get-RestFlag @("-Prefix", "--prefix") ""
+    $noProbe = $Rest -contains "-NoProbe" -or $Rest -contains "--no-probe"
+    $noRestart = $Rest -contains "-NoRestart" -or $Rest -contains "--no-restart"
+    Write-Step "==> route hunt"
+    Write-Info ("tries   : " + $tries)
+    Write-Info ("minutes : " + $minutes)
+    if ($country) { Write-Info ("country : " + $country) }
+    if ($prefix) { Write-Info ("prefix  : " + $prefix) }
+    if ($noProbe) { Write-Info "probe   : off, the route is taken on trust" }
+    if ($noRestart) { Write-Info "restart : off, the service keeps its current process" }
+    Write-Step ""
+    $trace = Invoke-Hunt $cfg $tries $minutes $country $prefix -NoProbe:$noProbe -NoRestart:$noRestart
+    Write-Step ""
+    if ($trace) {
+        Write-Ok ("live route: " + $trace.Ip + " " + $trace.Country)
+        Write-Info "send the prompt again, the meter is on the new block"
+    } else {
+        Write-Bad "no usable route found"
+        Write-Info "add proxies: opencode-unlimited proxy pool add socks5://host:port"
+        Write-Info "or point at a list: opencode-unlimited proxy pool fetch <url>"
+    }
+}
+
+function Cmd-Watch {
+    $follow = $Rest -contains "-Follow" -or $Rest -contains "--follow" -or $Rest -contains "-f"
+    $auto = $Rest -contains "-Auto" -or $Rest -contains "--auto"
+    $all = $Rest -contains "-All" -or $Rest -contains "--all"
+    $helper = Join-Path $script:Root "lib\log-watch.js"
+    if (-not (Test-Path $helper)) { Write-Bad ("missing helper: " + $helper); return }
+    Write-Step "==> free limit watcher"
+    $scanArgs = @("scan")
+    if ($all) { $scanArgs += "--reset" }
+    $first = $true
+    while ($true) {
+        $scan = $null
+        try { $scan = (Invoke-NodeHelper $helper $scanArgs) | ConvertFrom-Json } catch { $scan = $null }
+        if (-not $scan -or -not $scan.file) {
+            Write-Bad "no opencode log found, start opencode once"
+            return
+        }
+        if ($first) {
+            Write-Info ("log    : " + $scan.file)
+            Write-Info ("offset : " + $scan.from + " -> " + $scan.offset)
+            $first = $false
+            $scanArgs = @("scan")
+        }
+        $events = @($scan.events)
+        if (-not $events.Count -and -not $follow) {
+            Write-Ok "no free-limit line in the new part of the log"
+            Write-Info "pass -all to rescan the whole file, -follow to keep tailing"
+        }
+        if ($events.Count -gt 6) {
+            Write-Info ("older events hidden: " + ($events.Count - 6))
+            $events = @($events[($events.Count - 6)..($events.Count - 1)])
+        }
+        $rotateSeen = 0
+        $handled = $false
+        foreach ($event in $events) {
+            $local = if ($event.at) { ([DateTime]$event.at).ToLocalTime() } else { Get-Date }
+            $when = if ($local.Date -eq (Get-Date).Date) { $local.ToString("HH:mm:ss") } else { $local.ToString("MM-dd HH:mm") }
+            $label = if ($event.message) { $event.message } else { "error" }
+            $reasonText = if ($event.reason) { "  [" + $event.reason + "]" } else { "" }
+            if ($event.kind -eq "rotate") {
+                $rotateSeen += 1
+                Write-Bad ("limit at " + $when + "   " + $label + $reasonText + "  run=" + $event.run)
+                if (-not $auto) { continue }
+                if (-not (Test-RotateGate)) {
+                    Write-Warn2 "rotation gate: 5 moves per 30 minutes, holding"
+                    continue
+                }
+                $cfg = Get-Config
+                $trace = Invoke-Hunt $cfg 4 8 "" ""
+                if ($trace) {
+                    Write-Ok ("route live: " + $trace.Ip + " " + $trace.Country)
+                    Write-Info "send the prompt again, the new block is in place"
+                    $handled = $true
+                    if ($follow) { return }
+                } else {
+                    Write-Warn2 "no usable route yet, still watching"
+                }
+            } else {
+                Write-Warn2 ("rate limit at " + $when + "   " + $label + $reasonText + "  run=" + $event.run)
+                Write-Info "that is a throttle, not the daily bucket: wait and retry"
+            }
+        }
+        if ($rotateSeen -gt 0 -and -not $auto -and -not $handled) {
+            Write-Info "next: opencode-unlimited hunt"
+            Write-Info "or let the watcher drive: opencode-unlimited watch -follow -auto"
+        }
+        if (-not $follow) { return }
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Cmd-Token {
+    $sub = if ($Rest.Count -ge 1) { $Rest[0].ToLowerInvariant() } else { "status" }
+    switch ($sub) {
+        "save" {
+            if (-not (Test-Path $script:AuthDir)) { Write-Bad ("no auth.json at " + $script:AuthDir); return }
+            New-Item -ItemType Directory -Path $script:AuthSnapshotDir -Force | Out-Null
+            Copy-Item $script:AuthDir $script:AuthSnapshot -Force
+            $size = (Get-Item $script:AuthSnapshot).Length
+            Write-Ok ("token snapshot saved, " + $size + " bytes")
+            Write-Info ("path: " + $script:AuthSnapshot)
+            Write-Info "local app data only, nothing synced, the registry is untouched"
+        }
+        "restore" {
+            if (-not (Test-Path $script:AuthSnapshot)) { Write-Bad "no snapshot yet, run: opencode-unlimited token save"; return }
+            $force = $Rest -contains "-Force" -or $Rest -contains "--force"
+            if ((Test-Path $script:AuthDir) -and -not $force) {
+                Write-Warn2 "auth.json is already there, pass -Force to overwrite it"
+                return
+            }
+            Copy-Item $script:AuthSnapshot $script:AuthDir -Force
+            Write-Ok "auth.json restored, no login needed"
+            Write-Info "restart opencode so it reads the file"
+        }
+        "drop" {
+            Remove-Item $script:AuthSnapshot -Force -ErrorAction SilentlyContinue
+            Write-Ok "token snapshot removed"
+        }
+        default {
+            $live = "missing"
+            if (Test-Path $script:AuthDir) {
+                $item = Get-Item $script:AuthDir
+                $live = $item.Length.ToString() + " bytes, " + $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+            }
+            $snap = "missing"
+            if (Test-Path $script:AuthSnapshot) {
+                $item = Get-Item $script:AuthSnapshot
+                $snap = $item.Length.ToString() + " bytes, " + $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+            }
+            Write-Info ("auth.json : " + $live)
+            Write-Info ("snapshot  : " + $snap)
+            Write-Info ("path      : " + $script:AuthSnapshot)
+            Write-Info "save keeps a local copy, restore puts it back after the app drops it"
+        }
+    }
 }
 
 function Get-OpenCodeExe {
@@ -852,10 +1453,15 @@ function Test-LimitOutput([string]$Text) {
     return ($Text -match "FreeUsageLimit|Free usage limit|free messages|free tier")
 }
 
+function Remove-ProbeSession([string]$OpenCode, [string]$SessionId) {
+    if (-not $SessionId) { return }
+    try { & $OpenCode session delete $SessionId 2>&1 | Out-Null } catch { }
+}
+
 function Invoke-AppProbe([string]$Directory) {
     $oc = Get-OpenCodeExe
     if (-not $oc -or -not (Test-Path $oc)) {
-        return [pscustomobject]@{ Ok = $false; Blocked = $false; Reason = "opencode binary not found"; Raw = ""; Model = "" }
+        return [pscustomobject]@{ Ok = $false; Blocked = $false; Broken = $true; Kind = "broken"; Reason = "opencode binary not found"; Raw = ""; Model = ""; Session = "" }
     }
     $cfg = Get-Config
     $info = Get-OpenCodeInfo
@@ -871,20 +1477,23 @@ function Invoke-AppProbe([string]$Directory) {
     $ErrorActionPreference = "Continue"
     Push-Location $work
     try {
-        $out = (& $oc run -m $model "reply with exactly: ok" 2>&1 | Out-String)
+        $out = (& $oc run --format json -m $model "reply with exactly: ok" 2>&1 | Out-String)
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
         $ErrorActionPreference = $previous
         if ($throwaway) { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
     }
+    $session = ""
+    if ($out -match "(ses_[A-Za-z0-9]+)") { $session = $Matches[1] }
+    if ($session) { Remove-ProbeSession $oc $session }
     if (Test-LimitOutput $out) {
-        return [pscustomobject]@{ Ok = $false; Blocked = $true; Reason = "app refused on free limit"; Raw = $out; Model = $model }
+        return [pscustomobject]@{ Ok = $false; Blocked = $true; Broken = $false; Kind = "limit"; Reason = "app refused on free limit"; Raw = $out; Model = $model; Session = $session }
     }
     if ($code -eq 0 -and $out -match "\bok\b") {
-        return [pscustomobject]@{ Ok = $true; Blocked = $false; Reason = "app answered"; Raw = $out; Model = $model }
+        return [pscustomobject]@{ Ok = $true; Blocked = $false; Broken = $false; Kind = "ok"; Reason = "app answered"; Raw = $out; Model = $model; Session = $session }
     }
-    return [pscustomobject]@{ Ok = $false; Blocked = $false; Reason = "app did not answer"; Raw = $out; Model = $model }
+    return [pscustomobject]@{ Ok = $false; Blocked = $false; Broken = $true; Kind = "broken"; Reason = "app did not answer"; Raw = $out; Model = $model; Session = $session }
 }
 
 function Get-VirtualIdentity {
@@ -928,16 +1537,19 @@ function Cmd-Identity {
     if ($action -eq "rotate") { Write-Ok "new device identity minted" }
 }
 
-function Add-EgressRecord([int]$Status, [int]$RetryAfter) {
+function Add-EgressRecord([int]$Status, [int]$RetryAfter, [string]$Country) {
     $cfg = Get-Config
-    $ip = Get-EgressIp $cfg.proxy -Force
-    if (-not $ip) { return "" }
+    $trace = Get-EgressTrace $cfg.proxy -Force
+    if (-not $trace.Ip) { return "" }
     $helper = Join-Path $script:Root "lib\egress.js"
-    if (-not (Test-Path $helper)) { return $ip }
-    $env:UNLIMITED_EGRESS_IP = $ip
+    if (-not (Test-Path $helper)) { return $trace.Ip }
+    $env:UNLIMITED_EGRESS_IP = $trace.Ip
+    if ($Country) { $env:UNLIMITED_EGRESS_COUNTRY = $Country }
+    elseif ($trace.Country) { $env:UNLIMITED_EGRESS_COUNTRY = $trace.Country }
     Invoke-NodeHelper $helper @("record", [string]$Status, [string]$RetryAfter) | Out-Null
     Remove-Item Env:\UNLIMITED_EGRESS_IP -ErrorAction SilentlyContinue
-    return $ip
+    Remove-Item Env:\UNLIMITED_EGRESS_COUNTRY -ErrorAction SilentlyContinue
+    return $trace.Ip
 }
 
 function Cmd-Block {
@@ -975,7 +1587,8 @@ function Cmd-Block {
     Write-Info "the meter keys on the block, an ipv4 address or an ipv6 /64"
     foreach ($row in @($data.blocks)) {
         $state = if ($row.spent) { "SPENT" } else { "open " }
-        Write-Info ($row.block.PadRight(24) + " " + $state + "  open=" + $row.open + " refused=" + $row.refused + "  last=" + $row.lastStatus)
+        $where = if ($row.country) { "  " + $row.country.PadRight(2) } else { "    " }
+        Write-Info ($row.block.PadRight(24) + " " + $state + $where + "  open=" + $row.open + " refused=" + $row.refused + "  last=" + $row.lastStatus)
     }
     $minutes = [math]::Floor($data.secondsToReset / 60)
     Write-Step ""
@@ -986,24 +1599,24 @@ function Cmd-Usage {
     $cfg = Get-Config
     $deep = $Rest -contains "-check" -or $Rest -contains "--check" -or $Rest -contains "-live" -or $Rest -contains "--live"
     Write-Step "==> free tier check"
-    $ip = Get-EgressIp $cfg.proxy -Force
+    $trace = Get-EgressTrace $cfg.proxy -Force
+    $ip = $trace.Ip
     Write-Info ("egress ip : " + $(if ($ip) { $ip } else { "unknown" }))
+    if ($trace.Country) { Write-Info ("country   : " + $trace.Country) }
+    if ($trace.Warp) { Write-Info ("warp      : " + $trace.Warp) }
     $cfg.lastIp = $ip
+    $cfg.lastCountry = $trace.Country
     Save-Config $cfg
 
     $helper = Join-Path $script:Root "lib\egress.js"
+    $row = $null
     $ledger = $null
-    if (Test-Path $helper) {
+    if ((Test-Path $helper) -and $ip) {
+        $raw = Invoke-NodeHelper $helper @("check", $ip)
+        try { $row = $raw | ConvertFrom-Json } catch { $row = $null }
+        if ($row -and -not $row.known) { $row = $null }
         $raw = Invoke-NodeHelper $helper @("show")
         try { $ledger = $raw | ConvertFrom-Json } catch { $ledger = $null }
-    }
-
-    $row = $null
-    if ($ledger -and $ip) {
-        $want = if ($ip -like "*:*") { ($ip -split ":")[0..3] -join ":" } else { $ip }
-        foreach ($item in @($ledger.blocks)) {
-            if ($item.block -like ($want + "*")) { $row = $item; break }
-        }
     }
 
     if ($row) {
@@ -1025,23 +1638,30 @@ function Cmd-Usage {
     if ($deep) {
         Write-Step ""
         Write-Step "app check"
-        Write-Info "this opens a throwaway session and spends one real message"
+        Write-Info "this opens a throwaway session, then deletes it"
         $app = Invoke-AppProbe ""
         if ($app.Ok) {
-            Add-EgressRecord 200 0 | Out-Null
+            Add-EgressRecord 200 0 $trace.Country | Out-Null
             Write-Ok "OPEN - the app answered on this connection"
         } elseif ($app.Blocked) {
-            Add-EgressRecord 429 0 | Out-Null
+            Add-EgressRecord 429 0 $trace.Country | Out-Null
             Write-Bad "BLOCKED - the app itself was refused on this connection"
         } else {
             Write-Warn2 ("unconfirmed - " + $app.Reason)
         }
+        if ($app.Session) { Write-Info ("probe session removed: " + $app.Session) }
+    }
+
+    if ($ledger) {
+        Write-Step ""
+        Write-Info ("blocks today: " + $ledger.total + "   spent " + $ledger.spent)
     }
 
     $midnight = [DateTime]::UtcNow.Date.AddDays(1)
     $wait = [math]::Floor(($midnight - [DateTime]::UtcNow).TotalMinutes)
     Write-Step ""
     Write-Info ("reset : " + $midnight.ToLocalTime().ToString("h:mm tt") + " local   in " + $wait + " minutes")
+    Write-Info "zero-cost detection: opencode-unlimited watch"
     Write-Info "skip the meter entirely: opencode-unlimited model"
 }
 
@@ -1119,6 +1739,7 @@ function Cmd-Reid {
         Write-Ok ("new id : " + $result.newId)
         Write-Info ("table  : " + $result.sessionTable)
         Write-Info ("messages: " + $result.messages + "   rows moved: " + $result.moved)
+        if ($null -ne $result.sequence) { Write-Info ("sequence: " + $result.sequence + " (counter kept ahead of the messages)") }
         foreach ($item in @($result.touched)) { if ($item) { Write-Info ("moved  : " + $item) } }
         Write-Info "open the new id in the app, the messages are all there"
         Write-Info "reid does not refill the quota, it only breaks a fork chain"
@@ -1317,11 +1938,34 @@ function Cmd-Status {
     Write-Step "plugin"
     Write-Info ("state      : " + (Get-PluginState))
     Write-Info ("path       : " + $script:PluginFile)
+    Write-Info ("config     : " + $(if (Test-PluginRegistered) { $script:PluginEntry + " listed" } else { "not listed, so opencode never loads it" }))
+    $live = Test-PluginLive
+    if ($live) {
+        Write-Info ("loaded     : opencode " + $live.version + ", hooks " + (@($live.hooks) -join ", ") + ", at " + $live.at)
+    }
+    Write-Step ""
+    Write-Step "automation"
+    $watchPid = Get-WatcherPid
+    $watchLive = $watchPid -gt 0 -and (Get-Process -Id $watchPid -ErrorAction SilentlyContinue)
+    Write-Info ("mode       : " + $(if ($cfg.autoMode) { "on" } else { "off" }))
+    Write-Info ("watcher    : " + $(if ($watchLive) { "running (pid " + $watchPid + ")" } else { "stopped" }))
+    Write-Info ("autostart  : " + (Get-AutoStartState))
+    $health = Get-ProxyHealthReport $cfg
+    if ($health) {
+        Write-Info ("pool health: " + $health.usable + " usable, " + $health.held + " parked of " + $health.total)
+    } else {
+        Write-Info "pool health: no pool yet"
+    }
     Write-Step ""
     Write-Step "network"
-    Write-Info ("egress ip  : " + (Get-EgressIp $cfg.proxy))
+    $trace = Get-EgressTrace $cfg.proxy
+    $ipText = if ($trace.Ip) { $trace.Ip } else { "unknown" }
+    if ($trace.Country) { $ipText = $ipText + "  " + $trace.Country }
+    if ($trace.Warp) { $ipText = $ipText + "  warp=" + $trace.Warp }
+    Write-Info ("egress ip  : " + $ipText)
     Write-Info ("ipMode     : " + $cfg.ipMode)
     Write-Info ("upstream   : " + $(if ($cfg.proxy) { $cfg.proxy } else { "none (manual)" }))
+    if ($cfg.proxyListUrl) { Write-Info ("list url   : " + $cfg.proxyListUrl) }
     $bridgePid = Get-BridgePid
     if ($bridgePid -gt 0 -and (Get-Process -Id $bridgePid -ErrorAction SilentlyContinue)) {
         Write-Info ("bridge     : running (pid " + $bridgePid + ", port " + $cfg.bridgePort + ")")
@@ -1350,29 +1994,364 @@ function Cmd-Status {
     Write-Info "details     : opencode-unlimited usage"
 }
 
-function Cmd-On {
-    Install-Plugin
+function Get-WatcherPid {
+    $raw = Read-TextFile $script:WatchPidFile
+    if (-not $raw) { return 0 }
+    $first = ($raw.Trim() -split "\s+")[0]
+    if ($first -match "^\d+$") { return [int]$first }
+    return 0
+}
+
+function Start-WatcherDaemon {
+    $watchPid = Get-WatcherPid
+    if ($watchPid -gt 0 -and (Get-Process -Id $watchPid -ErrorAction SilentlyContinue)) {
+        Write-Info ("watcher already running (pid " + $watchPid + ")")
+        return $true
+    }
+    $entry = Join-Path $script:ScriptDir "opencode-unlimited.ps1"
+    if (-not (Test-Path $entry)) {
+        Write-Warn2 ("watcher entry not found: " + $entry)
+        return $false
+    }
+    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $entry, "watch", "-follow", "-auto")
+    $errFile = $script:WatchLogFile + ".err"
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WindowStyle Hidden -PassThru -RedirectStandardOutput $script:WatchLogFile -RedirectStandardError $errFile
+    } catch {
+        Write-Warn2 ("watcher could not start: " + $_.Exception.Message)
+        return $false
+    }
+    Start-Sleep -Milliseconds 900
+    if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
+        Write-TextFile $script:WatchPidFile ([string]$proc.Id)
+        Write-Ok ("watcher running (pid " + $proc.Id + "), log " + $script:WatchLogFile)
+        return $true
+    }
+    Write-Warn2 ("watcher exited at once, read " + $errFile)
+    return $false
+}
+
+function Stop-WatcherDaemon {
+    $watchPid = Get-WatcherPid
+    if ($watchPid -gt 0) {
+        $proc = Get-Process -Id $watchPid -ErrorAction SilentlyContinue
+        if ($proc) {
+            Stop-Process -Id $watchPid -Force -ErrorAction SilentlyContinue
+            Write-Ok "watcher stopped"
+        }
+    }
+    Remove-Item $script:WatchPidFile -Force -ErrorAction SilentlyContinue
+}
+
+function Get-AutoStartState {
+    $result = Invoke-Native "schtasks.exe" @("/Query", "/TN", $script:AutoTaskName)
+    if ($result.Code -eq 0 -and $result.Text -notmatch "ERROR:") { return "installed" }
+    return "absent"
+}
+
+function Install-AutoStart {
+    $entry = Join-Path $script:ScriptDir "opencode-unlimited.ps1"
+    if (-not (Test-Path $entry)) { return $false }
+    $task = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$entry`" watch -follow -auto"
+    $result = Invoke-Native "schtasks.exe" @("/Create", "/F", "/SC", "ONLOGON", "/TN", $script:AutoTaskName, "/TR", $task)
+    if ($result.Code -eq 0) {
+        Write-Ok ("autostart task: " + $script:AutoTaskName + " at logon")
+        return $true
+    }
+    Write-Warn2 "autostart task was not created"
+    if ($result.Text) { Write-Info $result.Text.Trim() }
+    return $false
+}
+
+function Remove-AutoStart {
+    $result = Invoke-Native "schtasks.exe" @("/Delete", "/F", "/TN", $script:AutoTaskName)
+    if ($result.Code -eq 0) { Write-Ok "autostart task removed" }
+}
+
+function Select-FreeModel($cfg) {
+    $info = Get-OpenCodeInfo
+    $free = @($info.freeModels)
+    $current = [string]$cfg.model
+    if ($current -and ($free.Count -eq 0 -or $free -contains $current)) { return $current }
+    $pick = [string]$info.freeModel
+    if (-not $pick -and $free.Count -gt 0) { $pick = [string]$free[0] }
+    if (-not $pick) { $pick = $script:DefaultModel }
+    if ($pick -ne $current) {
+        $cfg.model = $pick
+        Save-Config $cfg
+    }
+    return $pick
+}
+
+function Invoke-AutoSetup($cfg, [switch]$KeepId, [switch]$NoReid, [switch]$NoProbe, [switch]$NoStart, [switch]$KeepRoute) {
+    $total = 7
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) {
+        Write-Bad "node is not on PATH, install Node.js 22.5 or newer first"
+        return $false
+    }
+
+    Write-Step ("[1/" + $total + "] prerequisites")
+    Write-Ok ("node " + ((& $node.Source --version) -join "").Trim())
+    $oc = Resolve-OpenCode
+    Write-Info ("opencode : " + $oc)
+    $dbPath = Get-DatabasePath
+    Write-Info ("database : " + $(if ($dbPath) { $dbPath } else { "not found, the app has not run yet" }))
+
+    Write-Step ""
+    Write-Step ("[2/" + $total + "] device identity")
+    $idHelper = Join-Path $script:Root "lib\identity.js"
+    if (-not (Test-Path $idHelper)) {
+        Write-Warn2 "identity helper missing"
+    } else {
+        $action = if ($KeepId) { "show" } else { "rotate" }
+        $raw = Invoke-NodeHelper $idHelper @($action)
+        $ident = $null
+        try { $ident = $raw | ConvertFrom-Json } catch { $ident = $null }
+        if ($ident -and $ident.deviceId) {
+            $tag = if ($KeepId) { "kept" } else { "fresh" }
+            Write-Ok ("device id : " + $ident.deviceId + "  (" + $tag + ")")
+            Write-Info ("generation: " + $ident.generation + "   fingerprint: " + $ident.fingerprint)
+            Write-Info "local file only, the registry and the real machine id are untouched"
+        } else {
+            Write-Warn2 "identity left as it was"
+        }
+    }
+
+    Write-Step ""
+    Write-Step ("[3/" + $total + "] model")
+    $model = Select-FreeModel $cfg
+    Write-Ok ("free model: " + $model)
+
+    Write-Step ""
+    Write-Step ("[4/" + $total + "] proxy pool")
+    $pool = @(Get-ProxyPool $cfg)
+    if ($pool.Count -eq 0) {
+        Write-Info "pool is empty, pulling a public list"
+        Update-ProxyList $cfg | Out-Null
+        $pool = @(Get-ProxyPool $cfg)
+    }
+    if ($pool.Count -gt 0) {
+        $report = Get-ProxyHealthReport $cfg
+        $tail = ""
+        if ($report) { $tail = ", " + $report.usable + " usable, " + $report.held + " parked" }
+        Write-Ok ([string]$pool.Count + " candidates" + $tail)
+    } else {
+        Write-Warn2 "no proxy list came back, the machine keeps its own route"
+    }
+
+    Write-Step ""
+    Write-Step ("[5/" + $total + "] egress route")
+    if ($KeepRoute) {
+        $trace = Get-EgressTrace $cfg.proxy -Force
+        if ($trace.Ip) { Write-Info ("left alone, egress " + $trace.Ip + " " + $trace.Country) }
+        else { Write-Warn2 "route unknown" }
+    } elseif ($pool.Count -eq 0) {
+        Write-Info "no pool to rotate through, nothing to change"
+    } else {
+        $tries = [int]$cfg.autoTries
+        $minutes = [int]$cfg.autoMinutes
+        if ($tries -le 0) { $tries = 12 }
+        if ($minutes -le 0) { $minutes = 8 }
+        Write-Info ("hunting: " + $tries + " tries, " + $minutes + " minute cap" + $(if ($NoProbe) { ", probe off" } else { ", each route probed" }))
+        $trace = Invoke-Hunt $cfg $tries $minutes "" "" -NoProbe:$NoProbe
+        if ($trace) {
+            Write-Ok ("route live: " + $trace.Ip + " " + $trace.Country + "  [" + $trace.Ms + " ms]")
+        } else {
+            Write-Warn2 "nothing in the pool worked, rolling back to direct"
+            $cfg.proxy = ""
+            $cfg.ipMode = "manual"
+            Save-Config $cfg
+            Apply-Proxy $cfg | Out-Null
+            Restart-Service
+        }
+    }
+
+    Write-Step ""
+    Write-Step ("[6/" + $total + "] sessions")
+    $here = (Get-Location).Path
+    Write-Info "clearing stored free-limit errors in every session, not just this folder"
+    Remove-StuckErrors
+    if ($NoReid -or -not $cfg.reidOnAuto) {
+        Write-Info "reid skipped"
+    } elseif (-not (Test-NodeSqlite)) {
+        Write-Warn2 "node 22.5+ required for reid, sessions left alone"
+    } else {
+        Show-ReidBatch (Invoke-ReidPath $here)
+    }
+
+    Write-Step ""
+    Write-Step ("[7/" + $total + "] watcher and plugin")
+    if (-not (Install-Plugin)) { Write-Warn2 "plugin not installed, everything else still runs" }
     Set-PluginEnabled $true
-    Write-Ok "identity plugin enabled"
+    Start-Sleep -Milliseconds 1200
+    $live = Test-PluginLive
+    if ($live) {
+        Write-Ok ("plugin loaded in opencode " + $live.version + ", hooks " + (@($live.hooks) -join ", "))
+    } else {
+        Write-Info "plugin is installed and listed, opencode picks it up on the next file save or app start"
+    }
+    if ($NoStart) {
+        Write-Info "watcher skipped, -NoStart was passed"
+    } else {
+        $cfg.autoMode = $true
+        Save-Config $cfg
+        Start-WatcherDaemon | Out-Null
+        if (Install-AutoStart) { $cfg.autoStart = $true }
+        Save-Config $cfg
+    }
+    return $true
+}
+
+function Cmd-On {
+    $cfg = Get-Config
+    Write-Step "==> opencode-unlimited on"
+    Write-Info "one pass: identity, model, pool, verified route, sessions, watcher"
+    Write-Info "after that the watcher keeps it moving by itself"
+    Write-Step ""
+    $ok = Invoke-AutoSetup $cfg `
+        -KeepId:($Rest -contains "-KeepId" -or $Rest -contains "--keep-id") `
+        -NoReid:($Rest -contains "-NoReid" -or $Rest -contains "--no-reid") `
+        -NoProbe:($Rest -contains "-NoProbe" -or $Rest -contains "--no-probe") `
+        -NoStart:($Rest -contains "-NoStart" -or $Rest -contains "--no-start") `
+        -KeepRoute:($Rest -contains "-KeepRoute" -or $Rest -contains "--keep-route")
+    Write-Step ""
+    if (-not $ok) {
+        Write-Bad "setup stopped early, see the notes above"
+        return
+    }
+    $trace = Get-EgressTrace $cfg.proxy
+    $ipText = if ($trace.Ip) { $trace.Ip } else { "unknown" }
+    if ($trace.Country) { $ipText = $ipText + "  " + $trace.Country }
+    $watcherText = if ($Rest -contains "-NoStart" -or $Rest -contains "--no-start") { "watcher off" } else { "watcher on" }
+    Write-Ok ("ready. egress " + $ipText + ", " + $watcherText + ", autostart " + $(if ($cfg.autoStart) { "installed" } else { "off" }))
+    Write-Info "state: opencode-unlimited status"
+    Write-Info "stop : opencode-unlimited off"
 }
 
 function Cmd-Off {
+    $cfg = Get-Config
+    Write-Step "==> opencode-unlimited off"
+    Stop-WatcherDaemon
+    Remove-AutoStart
+    Stop-Bridge
+    $cfg.autoMode = $false
+    $cfg.autoStart = $false
+    $cfg.proxy = ""
+    $cfg.ipMode = "manual"
+    Save-Config $cfg
     Set-PluginEnabled $false
-    Write-Ok "identity plugin disabled"
+    Apply-Proxy $cfg | Out-Null
+    Restart-Service
+    Write-Step ""
+    Write-Ok "watcher stopped, autostart gone, egress direct again"
+    Write-Info "sessions, messages and the identity file were not touched"
 }
 
 function Show-ProxyPool($cfg) {
     $pool = @(Get-ProxyPool $cfg)
+    $cache = Get-Json $script:PoolCacheFile
     if (-not $pool.Count) {
         Write-Info "pool: empty"
         Write-Info "opencode-unlimited proxy pool add socks5://host:port"
+        Write-Info "opencode-unlimited proxy pool fetch https://example.com/list.txt"
         return
     }
     $active = [int]$cfg.proxyIndex
     Write-Info ("pool: " + $pool.Count + " entries, active #" + ($active + 1))
-    for ($i = 0; $i -lt $pool.Count; $i++) {
+    $shown = [Math]::Min($pool.Count, 20)
+    for ($i = 0; $i -lt $shown; $i++) {
         $mark = if ($i -eq $active) { "->" } else { "  " }
         Write-Info ("  " + $mark + " " + ($i + 1) + ". " + $pool[$i])
+    }
+    if ($pool.Count -gt $shown) { Write-Info ("  .. " + ($pool.Count - $shown) + " more, use: proxy stats") }
+    if ($cache -and $cache.proxies) { Write-Info ("list cache: " + @($cache.proxies).Count + " from " + $cache.source) }
+    if ($cfg.proxyListUrl) { Write-Info ("list url  : " + $cfg.proxyListUrl) }
+}
+
+function Show-ProxyStats($cfg) {
+    $report = Get-ProxyHealthReport $cfg
+    if (-not $report) {
+        Write-Info "pool: empty"
+        Write-Info "opencode-unlimited proxy pool fetch"
+        return
+    }
+    Write-Info ("pool    : " + $report.total + " entries, " + $report.usable + " usable, " + $report.held + " parked")
+    $index = 0
+    foreach ($row in @($report.detail | Select-Object -First 40)) {
+        $index++
+        $state = if ($row.quarantined) { "park" } elseif ($row.ms -gt $script:SlowProxyMs) { "slow" } elseif ($row.ms -gt 0) { "ok  " } else { "new " }
+        $msText = if ($row.ms -gt 0) { ([string]$row.ms).PadLeft(5) + " ms" } else { "    ---" }
+        $failText = ([string]$row.fail).PadLeft(2)
+        Write-Info ("  " + ([string]$index).PadLeft(2) + ". " + $state + " " + $msText + "  fail=" + $failText + "  " + $row.url)
+    }
+}
+
+function Test-ProxyBatch($cfg, [int]$Top) {
+    $pool = @(Get-RankedProxyPool $cfg)
+    if (-not $pool.Count) {
+        Write-Bad "pool is empty, run: opencode-unlimited proxy pool fetch"
+        return
+    }
+    if ($Top -le 0) { $Top = 20 }
+    $limit = [Math]::Min($pool.Count, $Top)
+    Write-Info ("probing " + $limit + " of " + $pool.Count + " proxies, 6s each")
+    $usable = 0
+    for ($i = 0; $i -lt $limit; $i++) {
+        $url = $pool[$i]
+        $trace = Get-EgressTrace $url -Force -TimeoutSec 6 -NoFallback
+        $ms = [int]$trace.Ms
+        if ($trace.Ip) {
+            Set-ProxyHealth $url $true $ms ""
+            $mark = if ($ms -gt $script:SlowProxyMs) { "slow" } else { "ok  " }
+            if ($ms -le $script:SlowProxyMs) { $usable++ }
+            Write-Info ("  " + $mark + " " + ([string]$ms).PadLeft(5) + " ms  " + $trace.Ip.PadRight(15) + " " + $trace.Country.PadRight(2) + "  " + $url)
+        } else {
+            Set-ProxyHealth $url $false 0 "timeout"
+            Write-Info ("  dead     ---  " + $url)
+        }
+    }
+    Write-Step ""
+    if ($usable -gt 0) { Write-Ok ($usable + " usable of " + $limit + " probed") }
+    else { Write-Bad ("0 usable of " + $limit + " probed") }
+}
+
+function Cmd-Plugin {
+    $sub = if ($Rest.Count -ge 1) { [string]$Rest[0] } else { "status" }
+    switch ($sub.ToLowerInvariant()) {
+        "install" {
+            Write-Step "==> installing the shield plugin"
+            if (Install-Plugin) {
+                Set-PluginEnabled $true
+                Write-Info "opencode reloads config on save, the plugin appears at the next request"
+                Write-Info "check it with: opencode-unlimited plugin status"
+            }
+        }
+        "off" {
+            Set-PluginEnabled $false
+            Remove-Item $script:PluginMarker -Force -ErrorAction SilentlyContinue
+            Write-Ok "plugin unlisted from opencode config and parked on disk"
+        }
+        "verify" {
+            Restart-Service
+            Start-Sleep -Milliseconds 1500
+            $live = Test-PluginLive
+            if ($live) { Write-Ok ("loaded, hooks " + (@($live.hooks) -join ", ")) }
+            else { Write-Warn2 "not reported by the server yet, open the app once and check again" }
+        }
+        default {
+            Write-Step "==> shield plugin"
+            Write-Info ("state  : " + (Get-PluginState))
+            Write-Info ("path   : " + $script:PluginFile)
+            Write-Info ("config : " + $(if (Test-PluginRegistered) { $script:PluginEntry + " listed" } else { "not listed" }))
+            $live = Test-PluginLive
+            if ($live) {
+                Write-Ok ("live   : opencode " + $live.version + ", hooks " + (@($live.hooks) -join ", "))
+                Write-Info "it stamps the virtual project id and session affinity on every model request"
+            } else {
+                Write-Info "live   : not reported yet"
+            }
+        }
     }
 }
 
@@ -1390,8 +2369,10 @@ function Cmd-Proxy {
             Write-Info "egress is direct again"
         }
         "next" {
-            Invoke-EgressRotation $cfg ""
+            $trace = Invoke-EgressRotation $cfg ""
             Save-Config $cfg
+            if ($trace) { Write-Ok ("egress: " + $trace.Ip + " " + $trace.Country) }
+            else { Write-Warn2 "no new route, see the notes above" }
         }
         "pool" {
             $action = if ($Rest.Count -ge 2) { $Rest[1] } else { "show" }
@@ -1424,8 +2405,25 @@ function Cmd-Proxy {
                 "clear" {
                     $cfg.proxyPool = @()
                     $cfg.proxyIndex = 0
+                    $cfg.proxyListUrl = ""
+                    Remove-Item $script:PoolCacheFile -Force -ErrorAction SilentlyContinue
                     Save-Config $cfg
                     Write-Ok "pool cleared, the current upstream was left alone"
+                }
+                "fetch" {
+                    $url = if ($Rest.Count -ge 3) { $Rest[2] } else { "" }
+                    if ($url -and $url -notmatch "^https?://") { Write-Bad "expected an http(s) list url"; return }
+                    $cfg.proxyListUrl = $url
+                    Save-Config $cfg
+                    $count = Update-ProxyList $cfg -Force
+                    if ($count -gt 0) { Write-Ok ("list cache: " + $count + " proxies") }
+                    Show-ProxyPool $cfg
+                }
+                "refresh" {
+                    if (-not $cfg.proxyListUrl) { Write-Bad "no list url yet, run: proxy pool fetch <url>"; return }
+                    $count = Update-ProxyList $cfg -Force
+                    if ($count -gt 0) { Write-Ok ("list cache refreshed: " + $count) }
+                    Show-ProxyPool $cfg
                 }
                 default {
                     Show-ProxyPool $cfg
@@ -1433,10 +2431,19 @@ function Cmd-Proxy {
             }
         }
         "status" {
+            $trace = Get-EgressTrace $cfg.proxy
+            $ipText = if ($trace.Ip) { $trace.Ip } else { "unknown" }
+            if ($trace.Country) { $ipText = $ipText + "  " + $trace.Country }
             Write-Info ("upstream : " + $(if ($cfg.proxy) { $cfg.proxy } else { "none (manual)" }))
             Write-Info ("bridge   : 127.0.0.1:" + $cfg.bridgePort)
-            Write-Info ("ip       : " + (Get-EgressIp $cfg.proxy))
+            Write-Info ("ip       : " + $ipText)
             Show-ProxyPool $cfg
+        }
+        "stats" { Show-ProxyStats $cfg }
+        "test" { Test-ProxyBatch $cfg (Get-RestInt @("-Top", "--top", "-n") 20) }
+        "healthreset" {
+            Invoke-ProxyHealth "reset" | Out-Null
+            Write-Ok "proxy health cleared, every entry is a clean slate again"
         }
         default {
             $url = if ($sub -eq "set" -and $Rest.Count -ge 2) { $Rest[1] } else { $Rest[0] }
@@ -1456,9 +2463,22 @@ function Cmd-Proxy {
             Save-Config $cfg
             Restart-Service
             Start-Sleep -Seconds 1
-            Write-Info ("egress ip via proxy: " + (Get-EgressIp $cfg.proxy))
+            $trace = Get-EgressTrace $cfg.proxy -Force
+            $ipText = if ($trace.Ip) { $trace.Ip } else { "unknown" }
+            if ($trace.Country) { $ipText = $ipText + "  " + $trace.Country }
+            Write-Info ("egress via proxy: " + $ipText)
         }
     }
+}
+
+function Invoke-WarpRotate($cfg) {
+    $warp = Get-WarpCli
+    if (-not $warp) { return $null }
+    & $warp disconnect 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+    & $warp connect 2>$null | Out-Null
+    Start-Sleep -Seconds 4
+    return Get-EgressTrace $cfg.proxy -Force
 }
 
 function Cmd-Warp {
@@ -1493,17 +2513,18 @@ function Cmd-Warp {
         }
         "rotate" {
             Write-Info "reconnecting warp, this can change the egress ip"
-            $before = Get-EgressIp $cfg.proxy
-            & $warp disconnect 2>$null | Out-Null
-            Start-Sleep -Seconds 2
-            & $warp connect 2>$null | Out-Null
-            Start-Sleep -Seconds 4
-            $after = Get-EgressIp $cfg.proxy
-            if ($after -eq $before) {
-                Write-Warn2 ("ip unchanged: " + $after)
-                Write-Info "warp does not guarantee a new ip, reconnect again or use a proxy"
+            $before = Get-EgressTrace $cfg.proxy -Force
+            $after = Invoke-WarpRotate $cfg
+            if (-not (Test-RouteOk $after "warp")) {
+                Write-Bad ("warp is not carrying the route (warp=" + $after.Warp + ")")
+                Write-Info "check: warp-cli status"
+                return
+            }
+            if ($before.Ip -and (Test-SameBlock $after.Ip $before.Ip)) {
+                Write-Warn2 ("same egress block: " + $after.Ip + " " + $after.Country)
+                Write-Info "warp does not guarantee a new ip, reconnect again or use a proxy pool"
             } else {
-                Write-Ok ("new egress ip: " + $before + " -> " + $after)
+                Write-Ok ("new egress block: " + $before.Ip + " -> " + $after.Ip + " " + $after.Country)
             }
         }
         default {
@@ -1587,7 +2608,22 @@ function Cmd-Doctor {
     if ($vid -and $vid.exists) { Write-Ok ("identity   : " + $vid.deviceId) } else { Write-Warn2 "identity   : missing, run: opencode-unlimited identity rotate" }
     $cfg = Get-Config
     Write-Info ("upstream   : " + $(if ($cfg.proxy) { $cfg.proxy } else { "none (manual)" }))
-    Write-Info ("egress ip  : " + (Get-EgressIp $cfg.proxy))
+    $trace = Get-EgressTrace $cfg.proxy
+    Write-Info ("egress ip  : " + $(if ($trace.Ip) { $trace.Ip + $(if ($trace.Country) { "  " + $trace.Country } else { "" }) } else { "unknown" }))
+    $logHelper = Join-Path $script:Root "lib\log-watch.js"
+    if (Test-Path $logHelper) {
+        $raw = Invoke-NodeHelper $logHelper @("path")
+        try { $logInfo = $raw | ConvertFrom-Json } catch { $logInfo = $null }
+        if ($logInfo -and $logInfo.file) { Write-Info ("log        : " + $logInfo.file) } else { Write-Warn2 "log        : not found yet" }
+    } else {
+        Write-Warn2 "log helper : missing"
+    }
+    if (Test-Path $script:AuthDir) {
+        if (Test-Path $script:AuthSnapshot) { Write-Ok "token      : live, snapshot present" }
+        else { Write-Info "token      : live, no snapshot (opencode-unlimited token save)" }
+    } else {
+        Write-Warn2 "token      : auth.json missing"
+    }
 }
 
 function Cmd-Uninstall {
@@ -1595,7 +2631,9 @@ function Cmd-Uninstall {
     Stop-Bridge
     Set-PluginEnabled $false
     Remove-Item $script:PluginFile -Force -ErrorAction SilentlyContinue
-    Remove-Item ($script:PluginFile + ".disabled") -Force -ErrorAction SilentlyContinue
+    Remove-Item ($script:PluginFile + ".off") -Force -ErrorAction SilentlyContinue
+    Remove-Item $script:PluginFolder -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $script:PluginMarker -Force -ErrorAction SilentlyContinue
     Write-Ok "plugin removed"
 
     $cfgPath = Join-Path $script:ConfigDir "opencode.jsonc"
@@ -1648,6 +2686,12 @@ function Cmd-Help {
     Write-Info "block                egress blocks seen today, and which are spent"
     Write-Info "block check          is the address you are on now still usable"
     Write-Info "usage                free check of the meter and the reset clock"
+    Write-Info "watch [-follow]      read the opencode log, zero messages spent"
+    Write-Info "watch -follow -auto  rotate the moment a limit line lands"
+    Write-Info "hunt                 rotate until the probe says the route is open"
+    Write-Info "hunt -Country XX -Prefix a.b.c.   steer the search"
+    Write-Info "hunt -NoProbe        rotate without spending a probe message"
+    Write-Info "token [save|restore] keep a local copy of auth.json"
     Write-Info "sessions [path]      list sessions and their ids for a folder"
     Write-Info "model                list providers and free models you can switch to"
     Write-Info "model <spec>         switch this folder to provider/model[#variant]"
@@ -1660,13 +2704,20 @@ function Cmd-Help {
     Write-Info "status               runtime, identity, network, bucket"
     Write-Info "doctor               check node, service, schema, identity"
     Write-Info "version              tool version plus the detected opencode version"
-    Write-Info "on | off             enable or disable the identity plugin"
+    Write-Info "on | off             full auto: identity, pool, route, watcher, autostart"
+    Write-Info "on -KeepId -NoProbe  keep the identity, skip the probe message"
     Write-Info "proxy set <url>      route opencode through socks5:// or http://"
     Write-Info "proxy off            drop the upstream, direct egress"
     Write-Info "proxy status         show the current upstream and the pool"
+    Write-Info "proxy stats          per-proxy health, speed and quarantine"
+    Write-Info "proxy test [-Top 20] probe the pool and park the dead ones"
     Write-Info "proxy pool add <url> queue proxies for reset to cycle through"
+    Write-Info "proxy pool fetch [u] pull a free proxy list into the pool"
+    Write-Info "proxy pool refresh   refetch the list now"
     Write-Info "proxy pool clear     empty the pool, upstream left as is"
     Write-Info "proxy next           jump to the next pooled proxy now"
+    Write-Info "plugin               is the shield loaded, and where it lives"
+    Write-Info "plugin install|off   list or unlist the shield in the opencode config"
     Write-Info "warp on|off|rotate   Cloudflare WARP path (optional)"
     Write-Info "run <args...>        run opencode, rotate on free-limit"
     Write-Info "uninstall            remove plugin, slash commands, state"
@@ -1680,6 +2731,9 @@ switch ($Command.ToLowerInvariant()) {
     "identity" { Cmd-Identity }
     "block" { Cmd-Block }
     "usage" { Cmd-Usage }
+    "watch" { Cmd-Watch }
+    "hunt" { Cmd-Hunt }
+    "token" { Cmd-Token }
     "status" { Cmd-Status }
     "sessions" { Cmd-Sessions }
     "model" { Cmd-Model }
@@ -1690,6 +2744,7 @@ switch ($Command.ToLowerInvariant()) {
     "on" { Cmd-On }
     "off" { Cmd-Off }
     "proxy" { Cmd-Proxy }
+    "plugin" { Cmd-Plugin }
     "warp" { Cmd-Warp }
     "run" { Cmd-Run }
     "doctor" { Cmd-Doctor }
