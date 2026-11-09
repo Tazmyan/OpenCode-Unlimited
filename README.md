@@ -1,23 +1,34 @@
 # OpenCode-Unlimited
 
-Fixes OpenCode's daily free-message limit from the command line: shows the real meter, watches the log for the exact moment a limit lands, clears the stale limit banner, rotates a local device id, and moves you onto a fresh network exit when you ask it to. Windows 10/11.
+Fixes OpenCode's daily free-message limit from the command line: shows the real meter, watches the log for the exact moment a limit lands, clears the stale limit banner, rotates a local device id, and moves you onto a fresh network exit when you ask it to. Works natively on macOS, Linux, and Windows 10/11.
 
 Nothing here writes to your registry, deletes a chat, or loses a message.
 
-```powershell
+```bash
 opencode-unlimited on        # one command, then forget about it
 ```
 
 Or drive it by hand:
 
-```powershell
+```bash
 opencode-unlimited usage
-opencode-unlimited reset "C:\my\project"
+opencode-unlimited reset "/path/to/project"
 ```
 
 ---
 
 ## Install
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/Tazmyan/OpenCode-Unlimited.git
+cd OpenCode-Unlimited
+chmod +x install.sh
+./install.sh
+```
+
+### Windows
 
 ```powershell
 git clone https://github.com/Tazmyan/OpenCode-Unlimited.git

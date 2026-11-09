@@ -5,3 +5,4 @@ unlimited-bridge.log
 node_modules/
 dist/
 scoop/
+*.dmg

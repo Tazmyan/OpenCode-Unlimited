@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  check:
+  check-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,8 +14,8 @@ jobs:
       - name: node syntax
         shell: pwsh
         run: |
-          node --check plugins/unlimited-shield.js
-          node --check lib/proxy-bridge.js
+          Get-ChildItem -Recurse -File -Include *.js | ForEach-Object { node --check $_.FullName }
+          node --check bin/opencode-unlimited
 
       - name: powershell syntax
         shell: pwsh
@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $bad = 0
-          Get-ChildItem -Recurse -File -Include *.ps1, *.js, *.cmd | ForEach-Object {
+          Get-ChildItem -Recurse -File -Include *.ps1, *.js, *.cmd, *.sh | ForEach-Object {
             $text = [System.IO.File]::ReadAllText($_.FullName)
             $count = ($text.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count
             if ($count -gt 0) {
@@ -51,3 +51,31 @@ jobs:
         shell: pwsh
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File bin/opencode-unlimited.ps1 help
+          node bin/opencode-unlimited help
+
+  check-posix:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: node syntax
+        run: |
+          for f in plugins/*.js lib/*.js bin/opencode-unlimited; do
+            node --check "$f"
+          done
+
+      - name: bash syntax
+        run: |
+          bash -n install.sh
+          bash -n scripts/release.sh
+
+      - name: cli responds
+        run: |
+          chmod +x bin/opencode-unlimited install.sh
+          ./bin/opencode-unlimited help
+
