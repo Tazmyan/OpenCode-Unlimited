@@ -10,7 +10,8 @@ BRIDGE_SRC="$SCRIPT_DIR/lib/proxy-bridge.js"
 USER_HOME="${HOME:-~}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/opencode"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
-PLUGIN_DST="$PLUGIN_DIR/unlimited-shield.js"
+PLUGIN_FOLDER="$PLUGIN_DIR/unlimited-shield"
+PLUGIN_DST="$PLUGIN_FOLDER/index.js"
 
 ok() { printf "  \033[32m[+]\033[0m %s\n" "$1"; }
 bad() { printf "  \033[31m[x]\033[0m %s\n" "$1"; exit 1; }
@@ -39,7 +40,7 @@ else
 fi
 
 # Deploy plugin
-mkdir -p "$PLUGIN_DIR"
+mkdir -p "$PLUGIN_FOLDER"
 cp -f "$PLUGIN_SRC" "$PLUGIN_DST"
 ok "plugin deployed: $PLUGIN_DST"
 

@@ -28,7 +28,10 @@ const stateFile = path.join(configDir, "unlimited.json");
 const identityFile = path.join(configDir, "identity.json");
 const legacyIdentity = path.join(userHome, ".opencode", "identity.json");
 const pluginDir = path.join(configDir, "plugins");
-const pluginFile = path.join(pluginDir, "unlimited-shield.js");
+const pluginFolder = path.join(pluginDir, "unlimited-shield");
+const pluginFile = path.join(pluginFolder, "index.js");
+const pluginEntry = "./plugins/unlimited-shield";
+const pluginMarker = path.join(configDir, "unlimited-shield.state.json");
 const pidFile = path.join(configDir, "unlimited-bridge.pid");
 const logFile = path.join(configDir, "unlimited-bridge.log");
 const ipCacheFile = path.join(configDir, "unlimited-ip.json");
@@ -519,19 +522,10 @@ function installSlashCommand() {
   };
   const argNames = ["opencode-unlimited:reset", "opencode-unlimited:id"];
 
-  let cfgPath = path.join(configDir, "opencode.jsonc");
-  if (!fs.existsSync(cfgPath)) cfgPath = path.join(configDir, "opencode.json");
-
-  let cfg = {};
-  if (fs.existsSync(cfgPath)) {
-    const raw = readTextFile(cfgPath);
-    try {
-      const cleaned = raw.replace(/\/\*[\s\S]*?\*\/|([^:]|^)\/\/.*$/gm, "$1");
-      cfg = JSON.parse(cleaned);
-    } catch {
-      writeWarn(`could not parse ${cfgPath}, slash commands skipped`);
-      return;
-    }
+  let cfg = readGlobalConfig();
+  if (!cfg) {
+    writeWarn("could not parse global config, slash commands skipped");
+    return;
   }
 
   if (!cfg.commands || typeof cfg.commands !== "object") {
@@ -550,39 +544,117 @@ function installSlashCommand() {
     };
   }
 
-  writeTextFile(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+  saveGlobalConfig(cfg);
   writeOk("slash commands: " + Object.keys(defs).join(", "));
+}
+
+function getGlobalConfigPath() {
+  const jsonc = path.join(configDir, "opencode.jsonc");
+  if (fs.existsSync(jsonc)) return jsonc;
+  return path.join(configDir, "opencode.json");
+}
+
+function readGlobalConfig() {
+  const cfgPath = getGlobalConfigPath();
+  if (fs.existsSync(cfgPath)) {
+    const raw = readTextFile(cfgPath);
+    try {
+      const cleaned = raw.replace(/\/\*[\s\S]*?\*\/|([^:]|^)\/\/.*$/gm, "$1");
+      return JSON.parse(cleaned);
+    } catch {
+      return null;
+    }
+  }
+  return {};
+}
+
+function saveGlobalConfig(cfg) {
+  const cfgPath = getGlobalConfigPath();
+  writeTextFile(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
+}
+
+function getRegisteredPlugins(cfg) {
+  if (!cfg || !cfg.plugins) return [];
+  if (Array.isArray(cfg.plugins)) return cfg.plugins;
+  if (typeof cfg.plugins === "string" && cfg.plugins) return [cfg.plugins];
+  return [];
+}
+
+function testPluginRegistered() {
+  const cfg = readGlobalConfig();
+  if (!cfg) return false;
+  return getRegisteredPlugins(cfg).includes(pluginEntry);
+}
+
+function registerPluginEntry(enabled) {
+  const cfg = readGlobalConfig();
+  if (!cfg) return false;
+  const list = getRegisteredPlugins(cfg).filter((p) => p !== pluginEntry);
+  if (enabled) {
+    list.push(pluginEntry);
+  }
+  cfg.plugins = list;
+  try {
+    saveGlobalConfig(cfg);
+    return true;
+  } catch (err) {
+    writeWarn(`global config not written: ${err.message}`);
+    return false;
+  }
+}
+
+function testPluginLive() {
+  if (fs.existsSync(pluginMarker)) {
+    try {
+      const marker = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
+      if (marker && marker.loaded === true) return marker;
+    } catch {}
+  }
+  return null;
 }
 
 function installPlugin() {
   if (!fs.existsSync(bundledPlugin)) {
     writeBad(`bundled plugin missing: ${bundledPlugin}`);
-    return;
+    return false;
   }
-  if (!fs.existsSync(pluginDir)) {
-    fs.mkdirSync(pluginDir, { recursive: true });
+  if (!fs.existsSync(pluginFolder)) {
+    fs.mkdirSync(pluginFolder, { recursive: true });
   }
   fs.copyFileSync(bundledPlugin, pluginFile);
-  writeOk(`plugin deployed: ${pluginFile}`);
+  if (!registerPluginEntry(true)) return false;
+  writeOk(`plugin installed and listed in opencode config: ${pluginEntry}`);
+  return true;
 }
 
 function getPluginState() {
-  if (fs.existsSync(pluginFile)) return "enabled";
-  if (fs.existsSync(pluginFile + ".disabled")) return "disabled";
+  const present = fs.existsSync(pluginFile);
+  const listed = testPluginRegistered();
+  if (present && listed) {
+    const live = testPluginLive();
+    if (live) return "loaded";
+    return "enabled (waiting for a server load)";
+  }
+  if (present || listed) return "partial";
   return "missing";
 }
 
 function setPluginEnabled(enabled) {
-  const disabled = pluginFile + ".disabled";
+  const disabled = pluginFile + ".off";
   if (enabled) {
-    if (fs.existsSync(disabled)) {
-      fs.renameSync(disabled, pluginFile);
+    if (!fs.existsSync(pluginFile)) {
+      if (fs.existsSync(disabled)) {
+        if (!fs.existsSync(pluginFolder)) fs.mkdirSync(pluginFolder, { recursive: true });
+        fs.renameSync(disabled, pluginFile);
+      } else if (fs.existsSync(bundledPlugin)) {
+        if (!fs.existsSync(pluginFolder)) fs.mkdirSync(pluginFolder, { recursive: true });
+        fs.copyFileSync(bundledPlugin, pluginFile);
+      }
     }
-  } else {
-    if (fs.existsSync(pluginFile)) {
-      fs.renameSync(pluginFile, disabled);
-    }
+    registerPluginEntry(true);
+    return;
   }
+  registerPluginEntry(false);
 }
 
 function setServiceEnv(name, value) {
@@ -909,6 +981,11 @@ function cmdStatus() {
   writeStep("plugin");
   writeInfo(`state      : ${getPluginState()}`);
   writeInfo(`path       : ${pluginFile}`);
+  writeInfo(`config     : ${testPluginRegistered() ? pluginEntry + " listed" : "not listed, so opencode never loads it"}`);
+  const live = testPluginLive();
+  if (live) {
+    writeInfo(`loaded     : opencode ${live.version}, hooks ${Array.isArray(live.hooks) ? live.hooks.join(", ") : ""}, at ${live.at}`);
+  }
   writeStep("");
   writeStep("network");
   writeInfo(`egress ip  : ${getEgressIp(cfg.proxy)}`);
@@ -940,12 +1017,54 @@ function cmdStatus() {
 function cmdOn() {
   installPlugin();
   setPluginEnabled(true);
-  writeOk("identity plugin enabled");
+  writeOk("identity plugin enabled and registered");
 }
 
 function cmdOff() {
   setPluginEnabled(false);
-  writeOk("identity plugin disabled");
+  try { fs.unlinkSync(pluginMarker); } catch {}
+  writeOk("identity plugin disabled and unlisted");
+}
+
+function cmdPlugin(rest) {
+  const sub = rest.length >= 1 ? rest[0] : "status";
+  switch (sub.toLowerCase()) {
+    case "install":
+      writeStep("==> installing the shield plugin");
+      if (installPlugin()) {
+        setPluginEnabled(true);
+        writeInfo("opencode reloads config on save, the plugin appears at the next request");
+        writeInfo("check it with: opencode-unlimited plugin status");
+      }
+      break;
+    case "off":
+      setPluginEnabled(false);
+      try { fs.unlinkSync(pluginMarker); } catch {}
+      writeOk("plugin unlisted from opencode config and parked on disk");
+      break;
+    case "verify":
+      restartService();
+      setTimeout(() => {
+        const live = testPluginLive();
+        if (live) writeOk(`loaded, hooks ${Array.isArray(live.hooks) ? live.hooks.join(", ") : ""}`);
+        else writeWarn("not reported by the server yet, open the app once and check again");
+      }, 1500);
+      break;
+    default: {
+      writeStep("==> shield plugin");
+      writeInfo(`state  : ${getPluginState()}`);
+      writeInfo(`path   : ${pluginFile}`);
+      writeInfo(`config : ${testPluginRegistered() ? pluginEntry + " listed" : "not listed"}`);
+      const live = testPluginLive();
+      if (live) {
+        writeOk(`live   : opencode ${live.version}, hooks ${Array.isArray(live.hooks) ? live.hooks.join(", ") : ""}`);
+        writeInfo("it stamps the virtual project id and session affinity on every model request");
+      } else {
+        writeInfo("live   : not reported yet");
+      }
+      break;
+    }
+  }
 }
 
 function cmdProxy(rest) {
@@ -1129,39 +1248,44 @@ function cmdDoctor() {
     writeWarn("service    : not reachable, start opencode once");
   }
 
-  try {
-    const pluginsRaw = childProcess.execSync(`"${oc}" api get /api/plugin`, {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000
-    });
-    let found = false;
-    let active = false;
+  const plLive = testPluginLive();
+  if (plLive) {
+    writeOk(`plugin     : loaded and active (hooks ${Array.isArray(plLive.hooks) ? plLive.hooks.join(", ") : ""})`);
+  } else {
     try {
-      const pJson = JSON.parse(pluginsRaw);
-      if (Array.isArray(pJson?.data)) {
-        const item = pJson.data.find((p) => p.id === "unlimited-shield");
-        if (item) {
-          found = true;
-          active = item.state?.status === "active" || item.status === "active";
+      const pluginsRaw = childProcess.execSync(`"${oc}" api get /api/plugin`, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000
+      });
+      let found = false;
+      let active = false;
+      try {
+        const pJson = JSON.parse(pluginsRaw);
+        if (Array.isArray(pJson?.data)) {
+          const item = pJson.data.find((p) => p.id === "unlimited-shield");
+          if (item) {
+            found = true;
+            active = item.state?.status === "active" || item.status === "active";
+          }
         }
+      } catch {
+        found = pluginsRaw.includes('"id":"unlimited-shield"');
+        active = /status["']:\s*["']active/.test(pluginsRaw);
+      }
+
+      if (found) {
+        if (active) {
+          writeOk("plugin     : loaded and active");
+        } else {
+          writeWarn("plugin     : loaded but not active");
+        }
+      } else {
+        writeWarn("plugin     : not loaded (optional, it does not change the quota)");
       }
     } catch {
-      found = pluginsRaw.includes('"id":"unlimited-shield"');
-      active = /status["']:\s*["']active/.test(pluginsRaw);
+      writeWarn("plugin     : not loaded (optional, it does not change the quota)");
     }
-
-    if (found) {
-      if (active) {
-        writeOk("plugin     : loaded and active");
-      } else {
-        writeWarn("plugin     : loaded but not active");
-      }
-    } else {
-      writeWarn("plugin     : not loaded, run: opencode-unlimited install");
-    }
-  } catch {
-    writeWarn("plugin     : could not inspect plugins");
   }
 
   const id = getIdentity();
@@ -1180,8 +1304,10 @@ function cmdUninstall() {
   writeStep("==> uninstalling opencode-unlimited");
   stopBridge();
   setPluginEnabled(false);
+  try { fs.rmSync(pluginFolder, { recursive: true, force: true }); } catch {}
   try { fs.unlinkSync(pluginFile); } catch {}
-  try { fs.unlinkSync(pluginFile + ".disabled"); } catch {}
+  try { fs.unlinkSync(pluginFile + ".off"); } catch {}
+  try { fs.unlinkSync(pluginMarker); } catch {}
   writeOk("plugin removed");
 
   let cfgPath = path.join(configDir, "opencode.jsonc");
@@ -1224,6 +1350,7 @@ function cmdHelp() {
   writeInfo("id [path] [-Db]      rotate the header id, or one project by folder");
   writeInfo("test [-live]         direct probe (free) or a real app check (costs 1 message)");
   writeInfo("status               identity, plugin, network, bucket");
+  writeInfo("plugin [action]      shield plugin: install, off, verify, status");
   writeInfo("on | off             enable or disable the identity plugin");
   writeInfo("proxy set <url>      route opencode through socks5:// or http://");
   writeInfo("proxy off            drop the upstream, direct egress");
@@ -1252,6 +1379,9 @@ switch (command) {
     break;
   case "status":
     cmdStatus();
+    break;
+  case "plugin":
+    cmdPlugin(rest);
     break;
   case "on":
     cmdOn();
