@@ -9,7 +9,7 @@ $zip = Join-Path $outDir "OpenCode-Unlimited-$version.zip"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-foreach ($item in @("bin", "lib", "plugins", "install.ps1", "README.md")) {
+foreach ($item in @("bin", "lib", "plugins", "install.ps1", "install.sh", "README.md")) {
     Copy-Item (Join-Path $root $item) (Join-Path $stage $item) -Recurse -Force
 }
 
