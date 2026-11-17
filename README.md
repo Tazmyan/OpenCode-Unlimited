@@ -1,5 +1,8 @@
 # OpenCode-Unlimited
 
+## Repository is no longer maintained
+# Use [LarpCode](https://github.com/Tazmyan/LarpCode) instead
+
 Fixes OpenCode's daily free-message limit from the command line: shows the real meter, watches the log for the exact moment a limit lands, clears the stale limit banner, rotates a local device id, and moves you onto a fresh network exit when you ask it to. Works natively on macOS, Linux, and Windows 10/11.
 
 Nothing here writes to your registry, deletes a chat, or loses a message.
